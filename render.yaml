@@ -4,7 +4,7 @@ services:
     runtime: python
     rootDir: app
     buildCommand: pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
-    startCommand: gunicorn app:app
+    startCommand: gunicorn app:app --timeout 120
     envVars:
       - key: RENDER
         value: "true"

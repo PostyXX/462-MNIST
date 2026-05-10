@@ -1,4 +1,5 @@
 import base64
+import gc
 import io
 import threading
 import webbrowser
@@ -191,6 +192,10 @@ def api_set_active():
     path = MODELS_DIR / secure_filename(filename)
     if not path.exists():
         return jsonify({'error': f'Model not found: {filename}'}), 404
+    # Free old model before loading new one to avoid two models in RAM simultaneously
+    with _lock:
+        _state['model'] = None
+    gc.collect()
     try:
         model, kind, classes, input_type = load_any(path)
     except Exception as e:
