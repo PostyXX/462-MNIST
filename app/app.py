@@ -244,7 +244,7 @@ def api_predict():
             for p in warped
         ])
         _, proba_dicts = model.run(None, {'float_input': X})
-        proba = np.array([[d[i] for i in range(len(classes))] for d in proba_dicts])
+        proba = np.array([[d[c] for c in classes] for d in proba_dicts])
         avg_probs = proba.mean(axis=0)
 
     else:
@@ -326,7 +326,7 @@ def predict_batch(model, kind, classes, pil_images, input_type='raw'):
             for img in pil_images
         ])
         labels, _ = model.run(None, {'float_input': X})
-        return [classes[int(p)] for p in labels]
+        return [str(p) for p in labels]
 
 
 @app.route('/api/dataset-stats')
