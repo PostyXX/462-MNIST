@@ -52,6 +52,43 @@ _state = {
 }
 
 
+# ---------------- numpy metrics (no sklearn needed) ----------------
+
+def _macro_metrics(true_idx, pred_idx, n_classes):
+    t = np.array(true_idx)
+    p = np.array(pred_idx)
+    acc = float((t == p).mean())
+    prec_list, rec_list = [], []
+    for c in range(n_classes):
+        tp = int(((p == c) & (t == c)).sum())
+        fp = int(((p == c) & (t != c)).sum())
+        fn = int(((p != c) & (t == c)).sum())
+        prec_list.append(tp / (tp + fp) if (tp + fp) > 0 else 0.0)
+        rec_list.append(tp / (tp + fn) if (tp + fn) > 0 else 0.0)
+    prec = float(np.mean(prec_list))
+    rec  = float(np.mean(rec_list))
+    f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    return acc, prec, rec, f1
+
+
+def _stratified_kfold(y, n_splits=5, random_state=42):
+    rng = np.random.RandomState(random_state)
+    y = np.array(y)
+    class_idx = {c: list(np.where(y == c)[0]) for c in np.unique(y)}
+    for indices in class_idx.values():
+        rng.shuffle(indices)
+    folds = [[] for _ in range(n_splits)]
+    for indices in class_idx.values():
+        for i, chunk in enumerate(np.array_split(indices, n_splits)):
+            folds[i].extend(chunk.tolist())
+    splits = []
+    for i in range(n_splits):
+        val = np.array(folds[i])
+        train = np.concatenate([np.array(folds[j]) for j in range(n_splits) if j != i])
+        splits.append((train, val))
+    return splits
+
+
 # ---------------- preprocessing ----------------
 
 def pil_affine(img, angle=0, translate=(0, 0), scale=1.0, fill=255):
@@ -438,37 +475,17 @@ def api_run_cv():
     if len(pil_images) < 10:
         return jsonify({'error': 'Not enough images (need at least 10).'}), 400
 
-    from sklearn.model_selection import StratifiedKFold
-
     y = np.array([classes.index(lbl) for lbl in true_labels])
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    splits = _stratified_kfold(y, n_splits=5, random_state=42)
     folds = []
 
-    if kind == 'rf':
-        from sklearn.ensemble import RandomForestClassifier
-        X = np.stack([
-            np.asarray(img.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1)
-            for img in pil_images
-        ])
-        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X, y)):
-            clf = RandomForestClassifier(
-                n_estimators=200, max_features='sqrt',
-                class_weight='balanced', random_state=42, n_jobs=-1,
-            )
-            clf.fit(X[train_idx], y[train_idx])
-            preds = clf.predict(X[val_idx])
-            acc = float((preds == y[val_idx]).mean())
-            folds.append({'fold': fold_idx + 1, 'accuracy': round(acc, 4),
-                          'n_val': int(len(val_idx))})
-
-    elif kind == 'cnn':
-        for fold_idx, (_, val_idx) in enumerate(skf.split(np.zeros(len(y)), y)):
-            val_imgs  = [pil_images[i] for i in val_idx]
-            val_true  = [true_labels[i] for i in val_idx]
-            val_preds = predict_batch(model_obj, kind, classes, val_imgs)
-            acc = sum(1 for t, p in zip(val_true, val_preds) if t == p) / len(val_true)
-            folds.append({'fold': fold_idx + 1, 'accuracy': round(acc, 4),
-                          'n_val': len(val_idx)})
+    for fold_idx, (_, val_idx) in enumerate(splits):
+        val_imgs  = [pil_images[i] for i in val_idx]
+        val_true  = [true_labels[i] for i in val_idx]
+        val_preds = predict_batch(model_obj, kind, classes, val_imgs)
+        acc = sum(1 for t, p in zip(val_true, val_preds) if t == p) / len(val_true)
+        folds.append({'fold': fold_idx + 1, 'accuracy': round(acc, 4),
+                      'n_val': len(val_idx)})
 
     accs = [f['accuracy'] for f in folds]
     return jsonify({
@@ -477,8 +494,7 @@ def api_run_cv():
         'std_accuracy':  round(float(np.std(accs)),  4),
         'n_total': len(y),
         'kind': kind,
-        'note': ('5-fold CV with retraining each fold' if kind == 'rf'
-                 else 'Evaluation-only CV — current model tested on each fold without retraining'),
+        'note': 'Evaluation-only CV — current model tested on each fold without retraining',
     })
 
 
@@ -492,7 +508,6 @@ def api_compare_models():
     if not model_files:
         return jsonify({'error': 'No model files found in app/models/.'}), 400
 
-    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
     results = []
     for fname in model_files:
         path = MODELS_DIR / fname
@@ -501,14 +516,15 @@ def api_compare_models():
             pred_labels = predict_batch(m, kind, classes, pil_images, input_type)
             true_idx = [classes.index(t) if t in classes else -1 for t in true_labels]
             pred_idx = [classes.index(p) if p in classes else -1 for p in pred_labels]
+            acc, prec, rec, f1 = _macro_metrics(true_idx, pred_idx, len(classes))
             results.append({
                 'name':       fname,
                 'kind':       kind,
                 'input_type': input_type,
-                'accuracy':   round(accuracy_score(true_idx, pred_idx), 4),
-                'precision':  round(precision_score(true_idx, pred_idx, average='macro', zero_division=0), 4),
-                'recall':     round(recall_score(true_idx, pred_idx,    average='macro', zero_division=0), 4),
-                'f1':         round(f1_score(true_idx, pred_idx,        average='macro', zero_division=0), 4),
+                'accuracy':   round(acc,  4),
+                'precision':  round(prec, 4),
+                'recall':     round(rec,  4),
+                'f1':         round(f1,   4),
             })
         except Exception as e:
             results.append({'name': fname, 'error': str(e)})
