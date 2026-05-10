@@ -6,26 +6,20 @@ from pathlib import Path
 
 import joblib
 import numpy as np
-import torch
-import torchvision.transforms.functional as TF
+import onnxruntime as ort
 from flask import Flask, jsonify, render_template, request
 from PIL import Image
-from safetensors.torch import load_file
-from torchvision import transforms
 from werkzeug.utils import secure_filename
-
-from model import DigitCNN
 
 CLASSES   = ['51', '52', '53', '54', '55']
 NORM_MEAN = 0.1307
 NORM_STD  = 0.3081
-DEVICE    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 BASE_DIR        = Path(__file__).parent
 MODELS_DIR      = BASE_DIR / 'models'
 MODELS_DIR.mkdir(exist_ok=True)
 ACTIVE_FILE     = MODELS_DIR / 'active.txt'
-SUPPORTED_EXTS  = ('.safetensors', '.joblib')
+SUPPORTED_EXTS  = ('.onnx', '.joblib')
 
 DATA_DIR = BASE_DIR.parent / 'data' / 'dataset'
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -33,14 +27,7 @@ for _cls in CLASSES:
     (DATA_DIR / _cls).mkdir(exist_ok=True)
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB
-
-eval_tfm = transforms.Compose([
-    transforms.Grayscale(num_output_channels=1),
-    transforms.Resize((28, 28)),
-    transforms.ToTensor(),
-    transforms.Normalize((NORM_MEAN,), (NORM_STD,)),
-])
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 
 TTA_VARIANTS = [
     dict(angle=0,  translate=(0, 0),  scale=1.00),
@@ -68,54 +55,38 @@ _state = {
     'kind':       None,
     'classes':    CLASSES,
     'filename':   None,
-    'input_type': 'raw',   # 'raw' or 'hog'
+    'input_type': 'raw',
 }
 
 
-# ---------------- model helpers ----------------
+# ---------------- preprocessing ----------------
 
-def load_cnn(path: Path):
-    model = DigitCNN(num_classes=len(CLASSES)).to(DEVICE)
-    state = load_file(str(path), device=str(DEVICE))
-    model.load_state_dict(state)
-    model.eval()
-    return model, CLASSES
-
-
-def load_rf(path: Path):
-    bundle = joblib.load(str(path))
-    if isinstance(bundle, dict) and 'model' in bundle:
-        model      = bundle['model']
-        classes    = list(bundle.get('classes', CLASSES))
-        input_type = bundle.get('input_type', 'raw')
-    else:
-        model      = bundle
-        classes    = list(CLASSES)
-        input_type = 'raw'
-    if not hasattr(model, 'predict_proba'):
-        raise ValueError('Loaded object has no predict_proba method.')
-    n_model_classes = len(getattr(model, 'classes_', []))
-    if n_model_classes and n_model_classes != len(classes):
-        raise ValueError(
-            f'Model has {n_model_classes} classes but bundle declares {len(classes)}.'
-        )
-    return model, classes, input_type
+def pil_affine(img, angle=0, translate=(0, 0), scale=1.0, fill=255):
+    w, h = img.size
+    img = img.rotate(angle, fillcolor=fill, resample=Image.BILINEAR)
+    new_w, new_h = int(w * scale), int(h * scale)
+    img = img.resize((new_w, new_h), Image.BILINEAR)
+    result = Image.new('L', (w, h), fill)
+    ox = (w - new_w) // 2 + translate[0]
+    oy = (h - new_h) // 2 + translate[1]
+    result.paste(img, (ox, oy))
+    return result
 
 
-def load_any(path: Path):
-    ext = path.suffix.lower()
-    if ext == '.safetensors':
-        model, classes = load_cnn(path)
-        return model, 'cnn', classes, 'raw'
-    if ext == '.joblib':
-        model, classes, input_type = load_rf(path)
-        return model, 'rf', classes, input_type
-    raise ValueError(f'Unsupported model extension: {ext}')
+def preprocess_cnn(pil_img):
+    arr = np.array(pil_img.convert('L').resize((28, 28), Image.BILINEAR), dtype=np.float32)
+    arr = (arr / 255.0 - NORM_MEAN) / NORM_STD
+    return arr[np.newaxis, np.newaxis, :, :]  # (1, 1, 28, 28)
+
+
+def softmax(x):
+    e = np.exp(x - x.max(axis=1, keepdims=True))
+    return e / e.sum(axis=1, keepdims=True)
 
 
 def preprocess_hog(pil_img):
     if not SKIMAGE_OK:
-        raise RuntimeError('scikit-image not installed. Run: .venv/Scripts/pip install scikit-image')
+        raise RuntimeError('scikit-image not installed.')
     arr = np.array(pil_img.convert('L'), dtype=np.float32)
     arr = _gaussian_filter(arr, sigma=0.8)
     try:
@@ -141,6 +112,39 @@ def preprocess_hog(pil_img):
                         visualize=False).astype(np.float32)
 
 
+# ---------------- model helpers ----------------
+
+def load_cnn(path: Path):
+    session = ort.InferenceSession(str(path), providers=['CPUExecutionProvider'])
+    return session, CLASSES
+
+
+def load_rf(path: Path):
+    bundle = joblib.load(str(path))
+    if isinstance(bundle, dict) and 'model' in bundle:
+        model      = bundle['model']
+        classes    = list(bundle.get('classes', CLASSES))
+        input_type = bundle.get('input_type', 'raw')
+    else:
+        model      = bundle
+        classes    = list(CLASSES)
+        input_type = 'raw'
+    if not hasattr(model, 'predict_proba'):
+        raise ValueError('Loaded object has no predict_proba method.')
+    return model, classes, input_type
+
+
+def load_any(path: Path):
+    ext = path.suffix.lower()
+    if ext == '.onnx':
+        model, classes = load_cnn(path)
+        return model, 'cnn', classes, 'raw'
+    if ext == '.joblib':
+        model, classes, input_type = load_rf(path)
+        return model, 'rf', classes, input_type
+    raise ValueError(f'Unsupported model extension: {ext}')
+
+
 def set_active(model, kind, classes, filename, input_type='raw'):
     with _lock:
         _state['model']      = model
@@ -164,7 +168,6 @@ def get_saved_active():
         p = MODELS_DIR / name
         if p.exists():
             return p
-    # Legacy fallback: look for current.* files from old scheme
     for ext in SUPPORTED_EXTS:
         p = MODELS_DIR / f'current{ext}'
         if p.exists():
@@ -219,7 +222,7 @@ def api_status():
             'kind':       _state['kind'],
             'filename':   _state['filename'],
             'classes':    _state['classes'],
-            'device':     str(DEVICE),
+            'device':     'cpu',
             'input_type': _state['input_type'],
         })
 
@@ -256,6 +259,7 @@ def api_predict():
         kind       = _state['kind']
         classes    = list(_state['classes'])
         input_type = _state['input_type']
+
     if model is None:
         return jsonify({'error': 'No model loaded. Upload one at /admin first.'}), 400
 
@@ -274,23 +278,12 @@ def api_predict():
         return jsonify({'error': f'Could not decode image: {e}'}), 400
 
     variants = TTA_VARIANTS if use_tta else TTA_VARIANTS[:1]
-    warped = [
-        TF.affine(
-            pil,
-            angle=v['angle'],
-            translate=list(v['translate']),
-            scale=v['scale'],
-            shear=[0.0, 0.0],
-            fill=255,
-        )
-        for v in variants
-    ]
+    warped = [pil_affine(pil, **v, fill=255) for v in variants]
 
     if kind == 'cnn':
-        batch = torch.cat([eval_tfm(p).unsqueeze(0) for p in warped], dim=0).to(DEVICE)
-        with torch.no_grad():
-            logits    = model(batch)
-            avg_probs = torch.softmax(logits, dim=1).mean(dim=0).cpu().numpy()
+        batch = np.concatenate([preprocess_cnn(p) for p in warped], axis=0)
+        logits = model.run(['output'], {'input': batch})[0]
+        avg_probs = softmax(logits).mean(axis=0)
 
     elif kind == 'rf':
         if input_type == 'hog':
@@ -300,8 +293,7 @@ def api_predict():
                 np.asarray(p.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1)
                 for p in warped
             ])
-        proba     = model.predict_proba(X)
-        avg_probs = proba.mean(axis=0)
+        avg_probs = model.predict_proba(X).mean(axis=0)
 
     else:
         return jsonify({'error': f'Unknown model kind: {kind}'}), 500
@@ -333,7 +325,6 @@ def api_upload_model():
             'error': f'Only these file types are accepted: {", ".join(SUPPORTED_EXTS)}.'
         }), 400
 
-    # Stage → validate → save. If validation fails the active model stays active.
     staging = MODELS_DIR / ('.staging_' + safe_name)
     f.save(str(staging))
     try:
@@ -373,9 +364,9 @@ def load_dataset_images():
 
 def predict_batch(model, kind, classes, pil_images, input_type='raw'):
     if kind == 'cnn':
-        batch = torch.stack([eval_tfm(img) for img in pil_images]).to(DEVICE)
-        with torch.no_grad():
-            preds = model(batch).argmax(1).cpu().numpy()
+        batch = np.concatenate([preprocess_cnn(img) for img in pil_images], axis=0)
+        logits = model.run(['output'], {'input': batch})[0]
+        preds = logits.argmax(axis=1)
         return [classes[int(p)] for p in preds]
     else:
         if input_type == 'hog':
@@ -523,9 +514,8 @@ def api_run_cv():
                           'n_val': int(len(val_idx))})
 
     elif kind == 'cnn':
-        all_imgs = pil_images
         for fold_idx, (_, val_idx) in enumerate(skf.split(np.zeros(len(y)), y)):
-            val_imgs  = [all_imgs[i] for i in val_idx]
+            val_imgs  = [pil_images[i] for i in val_idx]
             val_true  = [true_labels[i] for i in val_idx]
             val_preds = predict_batch(model_obj, kind, classes, val_imgs)
             acc = sum(1 for t, p in zip(val_true, val_preds) if t == p) / len(val_true)
@@ -554,9 +544,7 @@ def api_compare_models():
     if not model_files:
         return jsonify({'error': 'No model files found in app/models/.'}), 400
 
-    from sklearn.metrics import (
-        accuracy_score, precision_score, recall_score, f1_score
-    )
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
     results = []
     for fname in model_files:
         path = MODELS_DIR / fname
