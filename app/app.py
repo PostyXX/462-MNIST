@@ -4,7 +4,6 @@ import threading
 import webbrowser
 from pathlib import Path
 
-import joblib
 import numpy as np
 import onnxruntime as ort
 from flask import Flask, jsonify, render_template, request
@@ -19,7 +18,7 @@ BASE_DIR        = Path(__file__).parent
 MODELS_DIR      = BASE_DIR / 'models'
 MODELS_DIR.mkdir(exist_ok=True)
 ACTIVE_FILE     = MODELS_DIR / 'active.txt'
-SUPPORTED_EXTS  = ('.onnx', '.joblib')
+SUPPORTED_EXTS  = ('.onnx',)
 
 DATA_DIR = BASE_DIR.parent / 'data' / 'dataset'
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -41,13 +40,6 @@ TTA_VARIANTS = [
     dict(angle=3,  translate=(0, -4), scale=1.05),
 ]
 
-try:
-    from scipy.ndimage import gaussian_filter as _gaussian_filter
-    from skimage.feature import hog as _skimage_hog
-    from skimage.filters import threshold_otsu as _threshold_otsu
-    SKIMAGE_OK = True
-except ImportError:
-    SKIMAGE_OK = False
 
 _lock  = threading.Lock()
 _state = {
@@ -84,57 +76,13 @@ def softmax(x):
     return e / e.sum(axis=1, keepdims=True)
 
 
-def preprocess_hog(pil_img):
-    if not SKIMAGE_OK:
-        raise RuntimeError('scikit-image not installed.')
-    arr = np.array(pil_img.convert('L'), dtype=np.float32)
-    arr = _gaussian_filter(arr, sigma=0.8)
-    try:
-        thresh     = _threshold_otsu(arr)
-        digit_mask = arr < thresh
-        rows = np.any(digit_mask, axis=1)
-        cols = np.any(digit_mask, axis=0)
-        if rows.any() and cols.any():
-            r0, r1 = np.where(rows)[0][[0, -1]]
-            c0, c1 = np.where(cols)[0][[0, -1]]
-            side   = max(r1 - r0 + 1, c1 - c0 + 1)
-            pad    = max(int(side * 0.20), 3)
-            r0 = max(0, r0 - pad);   r1 = min(arr.shape[0]-1, r1 + pad)
-            c0 = max(0, c0 - pad);   c1 = min(arr.shape[1]-1, c1 + pad)
-            arr = arr[r0:r1+1, c0:c1+1]
-    except Exception:
-        pass
-    img_out = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
-    img_out = img_out.resize((28, 28), Image.BILINEAR)
-    arr     = np.array(img_out, dtype=np.float32) / 255.0
-    return _skimage_hog(arr, orientations=9, pixels_per_cell=(4, 4),
-                        cells_per_block=(2, 2), block_norm='L2-Hys',
-                        visualize=False).astype(np.float32)
-
-
 # ---------------- model helpers ----------------
 
 def load_onnx(path: Path):
     session = ort.InferenceSession(str(path), providers=['CPUExecutionProvider'])
     input_names = [i.name for i in session.get_inputs()]
-    # CNN uses 'input', RF (skl2onnx) uses 'float_input'
     kind = 'rf' if 'float_input' in input_names else 'cnn'
     return session, kind, CLASSES
-
-
-def load_rf(path: Path):
-    bundle = joblib.load(str(path))
-    if isinstance(bundle, dict) and 'model' in bundle:
-        model      = bundle['model']
-        classes    = list(bundle.get('classes', CLASSES))
-        input_type = bundle.get('input_type', 'raw')
-    else:
-        model      = bundle
-        classes    = list(CLASSES)
-        input_type = 'raw'
-    if not hasattr(model, 'predict_proba'):
-        raise ValueError('Loaded object has no predict_proba method.')
-    return model, classes, input_type
 
 
 def load_any(path: Path):
@@ -142,9 +90,6 @@ def load_any(path: Path):
     if ext == '.onnx':
         session, kind, classes = load_onnx(path)
         return session, kind, classes, 'raw'
-    if ext == '.joblib':
-        model, classes, input_type = load_rf(path)
-        return model, 'rf', classes, input_type
     raise ValueError(f'Unsupported model extension: {ext}')
 
 
@@ -289,19 +234,12 @@ def api_predict():
         avg_probs = softmax(logits).mean(axis=0)
 
     elif kind == 'rf':
-        if input_type == 'hog':
-            X = np.stack([preprocess_hog(p) for p in warped])
-        else:
-            X = np.stack([
-                np.asarray(p.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1).astype(np.float32)
-                for p in warped
-            ])
-        # RF ONNX (skl2onnx) uses float_input + returns list-of-dicts proba
-        if hasattr(model, 'run'):
-            _, proba_dicts = model.run(None, {'float_input': X})
-            proba = np.array([[d[i] for i in range(len(classes))] for d in proba_dicts])
-        else:
-            proba = model.predict_proba(X)
+        X = np.stack([
+            np.asarray(p.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1).astype(np.float32)
+            for p in warped
+        ])
+        _, proba_dicts = model.run(None, {'float_input': X})
+        proba = np.array([[d[i] for i in range(len(classes))] for d in proba_dicts])
         avg_probs = proba.mean(axis=0)
 
     else:
@@ -378,21 +316,12 @@ def predict_batch(model, kind, classes, pil_images, input_type='raw'):
         preds = logits.argmax(axis=1)
         return [classes[int(p)] for p in preds]
     else:
-        if input_type == 'hog':
-            X = np.stack([preprocess_hog(img) for img in pil_images])
-        else:
-            X = np.stack([
-                np.asarray(img.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1).astype(np.float32)
-                for img in pil_images
-            ])
-        # RF ONNX
-        if hasattr(model, 'run'):
-            labels, _ = model.run(None, {'float_input': X})
-            return [classes[int(p)] for p in labels]
-        # RF sklearn joblib
-        raw = model.predict(X.astype(np.uint8))
-        model_cls = list(getattr(model, 'classes_', range(len(classes))))
-        return [classes[model_cls.index(p) if p in model_cls else int(p)] for p in raw]
+        X = np.stack([
+            np.asarray(img.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1).astype(np.float32)
+            for img in pil_images
+        ])
+        labels, _ = model.run(None, {'float_input': X})
+        return [classes[int(p)] for p in labels]
 
 
 @app.route('/api/dataset-stats')
