@@ -114,9 +114,12 @@ def preprocess_hog(pil_img):
 
 # ---------------- model helpers ----------------
 
-def load_cnn(path: Path):
+def load_onnx(path: Path):
     session = ort.InferenceSession(str(path), providers=['CPUExecutionProvider'])
-    return session, CLASSES
+    input_names = [i.name for i in session.get_inputs()]
+    # CNN uses 'input', RF (skl2onnx) uses 'float_input'
+    kind = 'rf' if 'float_input' in input_names else 'cnn'
+    return session, kind, CLASSES
 
 
 def load_rf(path: Path):
@@ -137,8 +140,8 @@ def load_rf(path: Path):
 def load_any(path: Path):
     ext = path.suffix.lower()
     if ext == '.onnx':
-        model, classes = load_cnn(path)
-        return model, 'cnn', classes, 'raw'
+        session, kind, classes = load_onnx(path)
+        return session, kind, classes, 'raw'
     if ext == '.joblib':
         model, classes, input_type = load_rf(path)
         return model, 'rf', classes, input_type
@@ -290,10 +293,16 @@ def api_predict():
             X = np.stack([preprocess_hog(p) for p in warped])
         else:
             X = np.stack([
-                np.asarray(p.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1)
+                np.asarray(p.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1).astype(np.float32)
                 for p in warped
             ])
-        avg_probs = model.predict_proba(X).mean(axis=0)
+        # RF ONNX (skl2onnx) uses float_input + returns list-of-dicts proba
+        if hasattr(model, 'run'):
+            _, proba_dicts = model.run(None, {'float_input': X})
+            proba = np.array([[d[i] for i in range(len(classes))] for d in proba_dicts])
+        else:
+            proba = model.predict_proba(X)
+        avg_probs = proba.mean(axis=0)
 
     else:
         return jsonify({'error': f'Unknown model kind: {kind}'}), 500
@@ -373,10 +382,15 @@ def predict_batch(model, kind, classes, pil_images, input_type='raw'):
             X = np.stack([preprocess_hog(img) for img in pil_images])
         else:
             X = np.stack([
-                np.asarray(img.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1)
+                np.asarray(img.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1).astype(np.float32)
                 for img in pil_images
             ])
-        raw = model.predict(X)
+        # RF ONNX
+        if hasattr(model, 'run'):
+            labels, _ = model.run(None, {'float_input': X})
+            return [classes[int(p)] for p in labels]
+        # RF sklearn joblib
+        raw = model.predict(X.astype(np.uint8))
         model_cls = list(getattr(model, 'classes_', range(len(classes))))
         return [classes[model_cls.index(p) if p in model_cls else int(p)] for p in raw]
 
