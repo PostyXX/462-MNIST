@@ -240,7 +240,7 @@ def api_predict():
 
     elif kind == 'rf':
         X = np.stack([
-            np.asarray(p.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1).astype(np.float32)
+            np.asarray(p.resize((28, 28), Image.BILINEAR), dtype=np.float32).reshape(-1) / 255.0
             for p in warped
         ])
         _, proba_dicts = model.run(None, {'float_input': X})
@@ -322,7 +322,7 @@ def predict_batch(model, kind, classes, pil_images, input_type='raw'):
         return [classes[int(p)] for p in preds]
     else:
         X = np.stack([
-            np.asarray(img.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1).astype(np.float32)
+            np.asarray(img.resize((28, 28), Image.BILINEAR), dtype=np.float32).reshape(-1) / 255.0
             for img in pil_images
         ])
         labels, _ = model.run(None, {'float_input': X})
