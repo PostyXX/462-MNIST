@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8" />
+<title>Analysis — Error Analysis & Cross-Validation</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+<style>
+  .cm-table { border-collapse: collapse; font-size: 0.9rem; margin: 8px 0; }
+  .cm-table th, .cm-table td { border: 1px solid #e5e5e5; padding: 8px 14px; text-align: center; min-width: 52px; }
+  .cm-table thead th { background: #f4f4f4; font-weight: 600; }
+  .cm-table .row-label { background: #f4f4f4; font-weight: 600; text-align: right; }
+  .metrics-table { border-collapse: collapse; width: 100%; font-size: 0.9rem; margin: 8px 0; }
+  .metrics-table th, .metrics-table td { border: 1px solid #e5e5e5; padding: 8px 12px; text-align: center; }
+  .metrics-table thead th { background: #f4f4f4; font-weight: 600; }
+  .metrics-table tr:hover td { background: #f9f9f9; }
+  .misclassified-grid { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; }
+  .mis-card { border: 1px solid #e5e5e5; border-radius: 8px; padding: 8px; text-align: center; background: #fff; }
+  .mis-card img { display: block; width: 56px; height: 56px; image-rendering: pixelated; border: 1px solid #ddd; }
+  .mis-card .true-lbl { font-size: 0.75rem; color: #166534; font-weight: 600; margin-top: 4px; }
+  .mis-card .pred-lbl { font-size: 0.75rem; color: #b91c1c; font-weight: 600; }
+  .cv-table { border-collapse: collapse; width: 100%; font-size: 0.9rem; margin: 8px 0; }
+  .cv-table th, .cv-table td { border: 1px solid #e5e5e5; padding: 8px 12px; text-align: center; }
+  .cv-table thead th { background: #f4f4f4; font-weight: 600; }
+  .cv-table tfoot td { background: #eef2ff; font-weight: 700; }
+  .summary-row { display: flex; gap: 16px; flex-wrap: wrap; margin: 8px 0; }
+  .stat-box { background: #f4f4f4; border-radius: 8px; padding: 10px 18px; text-align: center; }
+  .stat-box .val { font-size: 1.5rem; font-weight: 700; color: #2563eb; }
+  .stat-box .lbl { font-size: 0.78rem; color: #555; margin-top: 2px; }
+  .note-box { background: #fef9c3; border: 1px solid #fde68a; border-radius: 8px; padding: 10px 14px; font-size: 0.85rem; margin: 8px 0; }
+</style>
+</head>
+<body>
+
+<nav>
+  <a href="/">Predict</a>
+  <a href="/admin">Admin</a>
+  <a href="/collect">Collect</a>
+  <a href="/analysis" class="active">Analysis</a>
+  <span class="spacer"></span>
+  <span class="status" id="modelStatus">checking…</span>
+</nav>
+
+<h1>Error Analysis & Cross-Validation</h1>
+<p class="muted">วิเคราะห์ประสิทธิภาพของ model บน dataset ปัจจุบัน</p>
+
+<!-- SECTION 0: Compare All Models -->
+<div class="card">
+  <h2>Compare All Models</h2>
+  <div class="row">
+    <button id="runCompareBtn" class="primary">Run Comparison</button>
+    <span class="muted">โหลดทุก model ใน app/models/ แล้วรันบน dataset เดียวกัน</span>
+  </div>
+  <div id="compareBanner" class="banner"></div>
+  <div id="compareResults" style="display:none">
+    <p class="muted" id="compareNote"></p>
+    <table class="metrics-table">
+      <thead><tr><th>Model</th><th>Type</th><th>Accuracy</th><th>Precision</th><th>Recall</th><th>F1-score</th></tr></thead>
+      <tbody id="compareBody"></tbody>
+    </table>
+    <canvas id="compareChart" height="90" style="margin-top:16px"></canvas>
+  </div>
+</div>
+
+<!-- SECTION 1: Error Analysis -->
+<div class="card">
+  <h2>Error Analysis</h2>
+  <div class="row">
+    <button id="runAnalysisBtn" class="primary">Run Analysis</button>
+    <span class="muted">วิเคราะห์ model บนทุกรูปใน dataset</span>
+  </div>
+  <div id="analysisBanner" class="banner"></div>
+  <div id="analysisResults" style="display:none">
+
+    <div class="summary-row" id="summaryRow"></div>
+
+    <h2>Confusion Matrix</h2>
+    <p class="muted">แถว = true label, คอลัมน์ = predicted label &mdash; เซลล์บน diagonal = ทำนายถูก (เขียว), นอก diagonal = สับสนระหว่าง class (แดง)</p>
+    <div id="cmWrap"></div>
+
+    <h2>Per-Class Metrics</h2>
+    <table class="metrics-table">
+      <thead><tr><th>Class</th><th>Precision</th><th>Recall</th><th>F1-score</th><th>Support</th><th>Correct</th></tr></thead>
+      <tbody id="metricsBody"></tbody>
+    </table>
+
+    <h2>Misclassified Examples</h2>
+    <p class="muted" id="misNote"></p>
+    <div class="misclassified-grid" id="misGrid"></div>
+  </div>
+</div>
+
+<!-- SECTION 2: Cross-Validation -->
+<div class="card">
+  <h2>Cross-Validation (5-fold)</h2>
+  <div class="row">
+    <button id="runCvBtn" class="primary">Run Cross-Validation</button>
+    <span class="muted">แบ่ง dataset เป็น 5 fold แล้วประเมินแต่ละ fold</span>
+  </div>
+  <div id="cvBanner" class="banner"></div>
+  <div id="cvResults" style="display:none">
+    <div class="note-box" id="cvNote"></div>
+    <table class="cv-table">
+      <thead><tr><th>Fold</th><th>Val Samples</th><th>Accuracy</th></tr></thead>
+      <tbody id="cvBody"></tbody>
+      <tfoot><tr><td colspan="2">Mean &plusmn; Std</td><td id="cvMean">—</td></tr></tfoot>
+    </table>
+    <div class="summary-row" id="cvSummary"></div>
+  </div>
+</div>
+
+<script>
+const THAI = { '51':'๕๑', '52':'๕๒', '53':'๕๓', '54':'๕๔', '55':'๕๕' };
+
+function pct(v) { return (v * 100).toFixed(1) + '%'; }
+
+async function refreshStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    const el = document.getElementById('modelStatus');
+    if (s.loaded) {
+      el.className = 'status loaded';
+      el.textContent = 'model: ' + s.filename + ' [' + (s.kind || '').toUpperCase() + ']';
+    } else {
+      el.className = 'status unloaded';
+      el.textContent = 'no model loaded';
+    }
+  } catch {}
+}
+refreshStatus();
+
+function setBanner(id, kind, msg) {
+  const el = document.getElementById(id);
+  el.className = 'banner ' + kind;
+  el.textContent = msg;
+}
+function clearBanner(id) {
+  const el = document.getElementById(id);
+  el.className = 'banner'; el.textContent = '';
+}
+
+function renderCM(cm, classes) {
+  const offDiag = cm.flatMap((row, ri) => row.filter((_, ci) => ri !== ci));
+  const maxOff  = Math.max(...offDiag, 1);
+
+  let html = '<table class="cm-table"><thead><tr><th>True \\ Pred</th>';
+  classes.forEach(c => {
+    html += `<th>${c}<br><span style="font-weight:400;font-size:0.75rem">${THAI[c]||''}</span></th>`;
+  });
+  html += '</tr></thead><tbody>';
+  cm.forEach((row, ri) => {
+    html += `<tr><td class="row-label">${classes[ri]} ${THAI[classes[ri]]||''}</td>`;
+    row.forEach((val, ci) => {
+      const isDiag = ri === ci;
+      let bg = '#fff', color = '#222';
+      if (isDiag && val > 0) {
+        bg = `hsl(142,55%,${92 - Math.min(val/Math.max(...row),1)*28}%)`;
+      } else if (!isDiag && val > 0) {
+        const alpha = 0.15 + (val / maxOff) * 0.65;
+        bg = `rgba(220,38,38,${alpha.toFixed(2)})`;
+        color = alpha > 0.5 ? '#fff' : '#7f1d1d';
+      }
+      html += `<td style="background:${bg};color:${color};font-weight:${isDiag?700:400}">${val}</td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  return html;
+}
+
+// Run Analysis
+document.getElementById('runAnalysisBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('runAnalysisBtn');
+  btn.disabled = true;
+  setBanner('analysisBanner', 'info', 'กำลังวิเคราะห์…');
+  document.getElementById('analysisResults').style.display = 'none';
+  try {
+    const r = await fetch('/api/run-analysis');
+    const d = await r.json();
+    if (!r.ok) { setBanner('analysisBanner', 'err', d.error || 'Error'); return; }
+    clearBanner('analysisBanner');
+
+    document.getElementById('summaryRow').innerHTML = [
+      { val: pct(d.accuracy),       lbl: 'Accuracy' },
+      { val: d.n_total,             lbl: 'Total Images' },
+      { val: d.n_errors,            lbl: 'Errors' },
+      { val: d.kind.toUpperCase(),  lbl: 'Model Type' },
+    ].map(s => `<div class="stat-box"><div class="val">${s.val}</div><div class="lbl">${s.lbl}</div></div>`).join('');
+
+    document.getElementById('cmWrap').innerHTML = renderCM(d.cm, d.classes);
+
+    document.getElementById('metricsBody').innerHTML = d.classes.map(cls => {
+      const m = d.per_class[cls];
+      const ok = m.f1 >= 0.9;
+      return `<tr>
+        <td><strong>${cls}</strong> ${THAI[cls]||''}</td>
+        <td>${pct(m.precision)}</td>
+        <td>${pct(m.recall)}</td>
+        <td style="color:${ok?'#166534':'#b91c1c'};font-weight:600">${pct(m.f1)}</td>
+        <td>${m.support}</td>
+        <td>${m.correct}</td>
+      </tr>`;
+    }).join('');
+
+    const mis = d.misclassified;
+    document.getElementById('misNote').textContent =
+      mis.length === 0
+        ? 'ไม่มีภาพที่ทำนายผิดบน dataset นี้ (accuracy = 100%)'
+        : `พบ ${d.n_errors} ภาพที่ทำนายผิด (แสดง ${mis.length} ตัวอย่าง):`;
+    document.getElementById('misGrid').innerHTML = mis.map(m => `
+      <div class="mis-card">
+        <img src="data:image/png;base64,${m.img}" alt="${m.true}→${m.pred}" />
+        <div class="true-lbl">true: ${m.true} ${THAI[m.true]||''}</div>
+        <div class="pred-lbl">pred: ${m.pred} ${THAI[m.pred]||''}</div>
+      </div>
+    `).join('');
+
+    document.getElementById('analysisResults').style.display = 'block';
+  } catch (err) {
+    setBanner('analysisBanner', 'err', 'Network error: ' + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// Compare All Models
+document.getElementById('runCompareBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('runCompareBtn');
+  btn.disabled = true;
+  setBanner('compareBanner', 'info', 'กำลังโหลดและรัน model ทุกตัว… (อาจใช้เวลา 10–60 วินาที)');
+  document.getElementById('compareResults').style.display = 'none';
+  try {
+    const r = await fetch('/api/compare-models');
+    const d = await r.json();
+    if (!r.ok) { setBanner('compareBanner', 'err', d.error || 'Error'); return; }
+    clearBanner('compareBanner');
+
+    document.getElementById('compareNote').textContent =
+      `เปรียบเทียบ ${d.results.length} model บน ${d.n_samples} ภาพ (sorted by F1-score)`;
+
+    const MEDAL = ['🥇','🥈','🥉'];
+    document.getElementById('compareBody').innerHTML = d.results.map((row, i) => {
+      if (row.error) return `<tr><td colspan="6" style="color:#b91c1c">${row.name}: ${row.error}</td></tr>`;
+      const best = i === 0;
+      return `<tr style="${best ? 'background:#f0fdf4;font-weight:600' : ''}">
+        <td>${MEDAL[i] || ''} ${row.name}</td>
+        <td><span class="kind-badge ${row.kind}">${row.kind.toUpperCase()}</span>${row.input_type==='hog'?'<span style="font-size:0.72rem;color:#7c3aed;margin-left:4px">HOG</span>':''}</td>
+        <td>${pct(row.accuracy)}</td>
+        <td>${pct(row.precision)}</td>
+        <td>${pct(row.recall)}</td>
+        <td style="color:${row.f1>=0.9?'#166534':'#b91c1c'}">${pct(row.f1)}</td>
+      </tr>`;
+    }).join('');
+
+    // Bar chart
+    const names = d.results.filter(r => !r.error).map(r => r.name.replace('.joblib','').replace('.safetensors',''));
+    const makeVals = key => d.results.filter(r => !r.error).map(r => r[key]);
+    const ctx = document.getElementById('compareChart').getContext('2d');
+    if (window._compareChartInst) window._compareChartInst.destroy();
+
+    const n = names.length;
+    const barW = 0.18;
+    const colors = ['#2563eb','#16a34a','#d97706','#dc2626'];
+    const metrics = ['accuracy','precision','recall','f1'];
+    const labels_m = ['Accuracy','Precision','Recall','F1'];
+
+    // Manual canvas bar chart
+    const canvas = document.getElementById('compareChart');
+    canvas.width = canvas.parentElement.offsetWidth || 700;
+    canvas.height = Math.max(260, n * 60);
+    const cw = canvas.width, ch = canvas.height;
+    const padL = 160, padR = 20, padT = 30, padB = 40;
+    const chartW = cw - padL - padR;
+    const chartH = ch - padT - padB;
+    const validRows = d.results.filter(r => !r.error);
+    const rowH = chartH / validRows.length;
+
+    ctx.clearRect(0, 0, cw, ch);
+    ctx.fillStyle = '#f9fafb';
+    ctx.fillRect(0, 0, cw, ch);
+
+    // Grid lines
+    [0, 0.25, 0.5, 0.75, 1.0].forEach(v => {
+      const x = padL + v * chartW;
+      ctx.strokeStyle = '#e5e5e5'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + chartH); ctx.stroke();
+      ctx.fillStyle = '#888'; ctx.font = '11px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText((v*100).toFixed(0)+'%', x, padT + chartH + 16);
+    });
+
+    validRows.forEach((row, ri) => {
+      const y0 = padT + ri * rowH;
+      // Row label
+      ctx.fillStyle = '#222'; ctx.font = '12px sans-serif'; ctx.textAlign = 'right';
+      ctx.fillText(row.name.replace('.joblib','').replace('.safetensors','').slice(0,22), padL - 8, y0 + rowH/2 + 4);
+      // Bars
+      metrics.forEach((m, mi) => {
+        const bh = (rowH - 8) / metrics.length - 2;
+        const by = y0 + 4 + mi * (bh + 2);
+        const bw = row[m] * chartW;
+        ctx.fillStyle = colors[mi];
+        ctx.globalAlpha = 0.82;
+        ctx.fillRect(padL, by, bw, bh);
+        ctx.globalAlpha = 1;
+        if (bw > 28) {
+          ctx.fillStyle = '#fff'; ctx.font = `bold ${Math.min(bh-2,11)}px sans-serif`;
+          ctx.textAlign = 'left';
+          ctx.fillText((row[m]*100).toFixed(1)+'%', padL + 3, by + bh - 2);
+        }
+      });
+    });
+
+    // Legend
+    metrics.forEach((m, mi) => {
+      const lx = padL + mi * 100;
+      ctx.fillStyle = colors[mi]; ctx.fillRect(lx, 6, 12, 12);
+      ctx.fillStyle = '#333'; ctx.font = '11px sans-serif'; ctx.textAlign = 'left';
+      ctx.fillText(labels_m[mi], lx + 16, 17);
+    });
+
+    document.getElementById('compareResults').style.display = 'block';
+  } catch (err) {
+    setBanner('compareBanner', 'err', 'Network error: ' + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+// Run CV
+document.getElementById('runCvBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('runCvBtn');
+  btn.disabled = true;
+  setBanner('cvBanner', 'info', 'กำลังรัน 5-fold CV… (อาจใช้เวลา 10–30 วินาที)');
+  document.getElementById('cvResults').style.display = 'none';
+  try {
+    const r = await fetch('/api/run-cv');
+    const d = await r.json();
+    if (!r.ok) { setBanner('cvBanner', 'err', d.error || 'Error'); return; }
+    clearBanner('cvBanner');
+
+    document.getElementById('cvNote').textContent = d.note;
+
+    document.getElementById('cvBody').innerHTML = d.folds.map(f => `
+      <tr>
+        <td>Fold ${f.fold}</td>
+        <td>${f.n_val}</td>
+        <td style="font-weight:600;color:${f.accuracy>=0.9?'#166534':'#b91c1c'}">${pct(f.accuracy)}</td>
+      </tr>
+    `).join('');
+    document.getElementById('cvMean').textContent =
+      `${pct(d.mean_accuracy)} ± ${pct(d.std_accuracy)}`;
+
+    document.getElementById('cvSummary').innerHTML = [
+      { val: pct(d.mean_accuracy),  lbl: 'Mean Accuracy' },
+      { val: '±' + pct(d.std_accuracy), lbl: 'Std Dev' },
+      { val: d.n_total,             lbl: 'Total Samples' },
+      { val: '5',                   lbl: 'Folds' },
+    ].map(s => `<div class="stat-box"><div class="val">${s.val}</div><div class="lbl">${s.lbl}</div></div>`).join('');
+
+    document.getElementById('cvResults').style.display = 'block';
+  } catch (err) {
+    setBanner('cvBanner', 'err', 'Network error: ' + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

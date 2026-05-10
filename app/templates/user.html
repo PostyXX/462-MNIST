@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Digit Predictor</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+
+<nav>
+  <a href="/" class="active">Predict</a>
+  <a href="/admin">Admin</a>
+  <a href="/collect">Collect</a>
+  <a href="/analysis">Analysis</a>
+  <span class="spacer"></span>
+  <span class="status" id="modelStatus">checking…</span>
+</nav>
+
+<h1>Handwritten Digit Predictor (51–55)</h1>
+<p class="muted">Draw a Thai numeral 51–55 (๕๑–๕๕) on the canvas, then press Predict.</p>
+
+<div class="row" style="margin-bottom:8px;align-items:center;gap:10px;flex-wrap:wrap;">
+  <label style="font-weight:600;white-space:nowrap">Model:</label>
+  <select id="modelSelect" style="padding:5px 10px;font-size:0.9rem;border:1px solid #aaa;border-radius:6px;min-width:180px;"></select>
+  <button id="activateBtn" style="padding:5px 14px;font-size:0.9rem;">Activate</button>
+  <span id="activateMsg" style="font-size:0.85rem;"></span>
+</div>
+
+<div class="canvas-wrap">
+  <canvas id="canvas" width="400" height="400"></canvas>
+  <div class="preview">
+    <canvas id="preview" width="28" height="28"></canvas>
+    <span>preview (28×28)</span>
+  </div>
+</div>
+
+<div class="row">
+  <button id="predictBtn" class="primary" disabled>Predict</button>
+  <button id="clearBtn">Clear</button>
+  <label class="toggle">
+    <input type="checkbox" id="ttaChk" checked />
+    Test-Time Augmentation
+  </label>
+</div>
+
+<div id="result">
+  <div>
+    <span class="pred" id="pred">—</span>
+    <span class="thai" id="thai"></span>
+  </div>
+  <div class="conf" id="conf"></div>
+  <div id="bars"></div>
+</div>
+
+<script>
+const THAI = { '51': '๕๑', '52': '๕๒', '53': '๕๓', '54': '๕๔', '55': '๕๕' };
+
+const modelSelect  = document.getElementById('modelSelect');
+const activateBtn  = document.getElementById('activateBtn');
+const activateMsg  = document.getElementById('activateMsg');
+
+async function loadModels() {
+  try {
+    const r = await fetch('/api/models');
+    const d = await r.json();
+    modelSelect.innerHTML = d.models.length === 0
+      ? '<option value="">— no models uploaded —</option>'
+      : d.models.map(m =>
+          `<option value="${m}"${m === d.active ? ' selected' : ''}>${m}</option>`
+        ).join('');
+    activateBtn.disabled = d.models.length === 0;
+  } catch {
+    modelSelect.innerHTML = '<option value="">— error loading —</option>';
+  }
+}
+
+activateBtn.addEventListener('click', async () => {
+  const filename = modelSelect.value;
+  if (!filename) return;
+  activateBtn.disabled = true;
+  activateMsg.style.color = '#555';
+  activateMsg.textContent = 'Loading…';
+  try {
+    const res = await fetch('/api/set-active', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filename }),
+    });
+    const d = await res.json();
+    if (!res.ok) {
+      activateMsg.style.color = '#b91c1c';
+      activateMsg.textContent = d.error || 'Failed';
+    } else {
+      activateMsg.style.color = '#166534';
+      activateMsg.textContent = `Activated (${d.kind.toUpperCase()})`;
+      await refreshStatus();
+    }
+  } catch (err) {
+    activateMsg.style.color = '#b91c1c';
+    activateMsg.textContent = 'Network error';
+  } finally {
+    activateBtn.disabled = false;
+  }
+});
+
+loadModels();
+
+const canvas    = document.getElementById('canvas');
+const ctx       = canvas.getContext('2d', { willReadFrequently: true });
+const previewC  = document.getElementById('preview');
+const previewX  = previewC.getContext('2d');
+const predictBtn= document.getElementById('predictBtn');
+const clearBtn  = document.getElementById('clearBtn');
+const ttaChk    = document.getElementById('ttaChk');
+const statusEl  = document.getElementById('modelStatus');
+const predEl    = document.getElementById('pred');
+const thaiEl    = document.getElementById('thai');
+const confEl    = document.getElementById('conf');
+const barsEl    = document.getElementById('bars');
+
+function clearCanvas() {
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 10;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  previewX.fillStyle = '#ffffff';
+  previewX.fillRect(0, 0, 28, 28);
+  predEl.textContent = '—';
+  thaiEl.textContent = '';
+  confEl.textContent = '';
+  barsEl.innerHTML = '';
+}
+clearCanvas();
+
+let drawing = false;
+function pos(e) {
+  const r = canvas.getBoundingClientRect();
+  const t = e.touches ? e.touches[0] : e;
+  return {
+    x: (t.clientX - r.left) * (canvas.width  / r.width),
+    y: (t.clientY - r.top ) * (canvas.height / r.height),
+  };
+}
+function start(e) { drawing = true; const p = pos(e); ctx.beginPath(); ctx.moveTo(p.x, p.y); e.preventDefault(); }
+function move(e)  { if (!drawing) return; const p = pos(e); ctx.lineTo(p.x, p.y); ctx.stroke(); e.preventDefault(); }
+function end(e)   { drawing = false; if (e) e.preventDefault(); }
+canvas.addEventListener('mousedown', start);
+canvas.addEventListener('mousemove', move);
+canvas.addEventListener('mouseup',   end);
+canvas.addEventListener('mouseleave',end);
+canvas.addEventListener('touchstart', start, { passive: false });
+canvas.addEventListener('touchmove',  move,  { passive: false });
+canvas.addEventListener('touchend',   end,   { passive: false });
+clearBtn.addEventListener('click', clearCanvas);
+
+function paintPreviewFromCanvas() {
+  previewX.fillStyle = '#fff';
+  previewX.fillRect(0, 0, 28, 28);
+  previewX.drawImage(canvas, 0, 0, 28, 28);
+}
+
+function kindBadge(kind) {
+  if (!kind) return '';
+  const k = kind.toLowerCase();
+  return `<span class="kind-badge ${k}">${k.toUpperCase()}</span>`;
+}
+
+async function refreshStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    if (s.loaded) {
+      statusEl.className = 'status loaded';
+      statusEl.innerHTML = `model: ${s.filename} ${kindBadge(s.kind)} • ${s.device}`;
+      predictBtn.disabled = false;
+    } else {
+      statusEl.className = 'status unloaded';
+      statusEl.textContent = 'no model loaded — go to Admin';
+      predictBtn.disabled = true;
+    }
+  } catch {
+    statusEl.className = 'status unloaded';
+    statusEl.textContent = 'backend unreachable';
+    predictBtn.disabled = true;
+  }
+}
+refreshStatus();
+
+predictBtn.addEventListener('click', async () => {
+  predictBtn.disabled = true;
+  paintPreviewFromCanvas();
+  try {
+    const dataUrl = canvas.toDataURL('image/png');
+    const res = await fetch('/api/predict', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ image: dataUrl, tta: ttaChk.checked }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      confEl.textContent = data.error || 'Prediction failed.';
+      predEl.textContent = '—'; thaiEl.textContent = ''; barsEl.innerHTML = '';
+      return;
+    }
+
+    predEl.textContent = data.prediction;
+    thaiEl.textContent = THAI[data.prediction] || '';
+    const ttaNote = ttaChk.checked ? `   (averaged over ${data.tta_count} TTA variants)` : '';
+    const kindNote = data.kind ? `   [${data.kind.toUpperCase()}]` : '';
+    confEl.textContent = `confidence: ${(data.confidence * 100).toFixed(1)}%${ttaNote}${kindNote}`;
+
+    barsEl.innerHTML = Object.entries(data.probs).map(([cls, p]) => `
+      <div class="bar-row">
+        <span class="label">${cls}</span>
+        <span class="bar"><div style="width:${(p * 100).toFixed(1)}%"></div></span>
+        <span class="pct">${(p * 100).toFixed(1)}%</span>
+      </div>
+    `).join('');
+  } catch (err) {
+    confEl.textContent = 'Network error: ' + (err.message || err);
+  } finally {
+    predictBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

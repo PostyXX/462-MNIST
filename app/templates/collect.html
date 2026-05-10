@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8" />
+<title>Collect — Data Collection</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+
+<nav>
+  <a href="/">Predict</a>
+  <a href="/admin">Admin</a>
+  <a href="/collect" class="active">Collect</a>
+  <a href="/analysis">Analysis</a>
+  <span class="spacer"></span>
+  <span class="status" id="modelStatus">checking…</span>
+</nav>
+
+<h1>Data Collection</h1>
+<p class="muted">เลือก label → วาดตัวเลขไทย → กด Save Sample เพื่อบันทึกลง dataset</p>
+
+<div class="card">
+  <div class="row">
+    <label for="labelSelect" style="font-weight:600">Label:</label>
+    <select id="labelSelect" style="padding:6px 10px;font-size:1rem;border:1px solid #aaa;border-radius:6px;">
+      <option value="51">51 (๕๑)</option>
+      <option value="52">52 (๕๒)</option>
+      <option value="53">53 (๕๓)</option>
+      <option value="54">54 (๕๔)</option>
+      <option value="55">55 (๕๕)</option>
+    </select>
+  </div>
+
+  <div class="canvas-wrap">
+    <canvas id="canvas" width="320" height="320"></canvas>
+  </div>
+
+  <div class="row">
+    <button id="saveBtn" class="primary">Save Sample</button>
+    <button id="clearBtn">Clear</button>
+  </div>
+  <div id="saveBanner" class="banner"></div>
+</div>
+
+<div class="card">
+  <h2>Dataset Stats</h2>
+  <div id="statsGrid" style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-top:8px;"></div>
+  <div style="margin-top:10px;font-size:0.9rem;color:#555;">
+    Total: <strong id="totalCount">0</strong> images
+  </div>
+</div>
+
+<script>
+const THAI = { '51':'๕๑', '52':'๕๒', '53':'๕๓', '54':'๕๔', '55':'๕๕' };
+const CLASSES = ['51','52','53','54','55'];
+
+const canvas   = document.getElementById('canvas');
+const ctx      = canvas.getContext('2d', { willReadFrequently: true });
+const saveBtn  = document.getElementById('saveBtn');
+const clearBtn = document.getElementById('clearBtn');
+const banner   = document.getElementById('saveBanner');
+const labelSel = document.getElementById('labelSelect');
+
+function initCanvas() {
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 18;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+}
+initCanvas();
+
+let drawing = false;
+function pos(e) {
+  const r = canvas.getBoundingClientRect();
+  const t = e.touches ? e.touches[0] : e;
+  return {
+    x: (t.clientX - r.left) * (canvas.width  / r.width),
+    y: (t.clientY - r.top ) * (canvas.height / r.height),
+  };
+}
+canvas.addEventListener('mousedown',  e => { drawing=true; const p=pos(e); ctx.beginPath(); ctx.moveTo(p.x,p.y); });
+canvas.addEventListener('mousemove',  e => { if (!drawing) return; const p=pos(e); ctx.lineTo(p.x,p.y); ctx.stroke(); });
+canvas.addEventListener('mouseup',    () => drawing=false);
+canvas.addEventListener('mouseleave', () => drawing=false);
+canvas.addEventListener('touchstart', e => { e.preventDefault(); drawing=true; const p=pos(e); ctx.beginPath(); ctx.moveTo(p.x,p.y); }, { passive:false });
+canvas.addEventListener('touchmove',  e => { e.preventDefault(); if (!drawing) return; const p=pos(e); ctx.lineTo(p.x,p.y); ctx.stroke(); }, { passive:false });
+canvas.addEventListener('touchend',   e => { e.preventDefault(); drawing=false; }, { passive:false });
+
+clearBtn.addEventListener('click', () => { initCanvas(); hideBanner(); });
+
+function showBanner(kind, msg) { banner.className='banner '+kind; banner.textContent=msg; }
+function hideBanner() { banner.className='banner'; banner.textContent=''; }
+
+saveBtn.addEventListener('click', async () => {
+  saveBtn.disabled = true;
+  showBanner('info', 'กำลังบันทึก…');
+  try {
+    const dataUrl = canvas.toDataURL('image/png');
+    const label = labelSel.value;
+    const res = await fetch('/api/save-sample', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image: dataUrl, label }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+      showBanner('err', 'Error: ' + (data.error || 'unknown'));
+    } else {
+      showBanner('ok', `บันทึกแล้ว: ${label} (${THAI[label]}) → ${data.filename}   [${label}: ${data.count} รูป]`);
+      initCanvas();
+      loadStats();
+    }
+  } catch (err) {
+    showBanner('err', 'Network error: ' + err.message);
+  } finally {
+    saveBtn.disabled = false;
+  }
+});
+
+async function loadStats() {
+  try {
+    const r = await fetch('/api/dataset-stats');
+    const d = await r.json();
+    const grid = document.getElementById('statsGrid');
+    grid.innerHTML = CLASSES.map(cls => `
+      <div style="text-align:center;padding:10px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;">
+        <div style="font-size:1.5rem;font-weight:700;color:#2563eb">${d.stats[cls] ?? 0}</div>
+        <div style="font-size:0.85rem;color:#555">${cls} ${THAI[cls]}</div>
+      </div>
+    `).join('');
+    document.getElementById('totalCount').textContent = d.total;
+  } catch {}
+}
+
+async function refreshModelStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    const el = document.getElementById('modelStatus');
+    if (s.loaded) {
+      el.className = 'status loaded';
+      el.textContent = 'model: ' + s.filename;
+    } else {
+      el.className = 'status unloaded';
+      el.textContent = 'no model loaded';
+    }
+  } catch {}
+}
+
+loadStats();
+refreshModelStatus();
+</script>
+</body>
+</html>

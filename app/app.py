@@ -1,0 +1,589 @@
+import base64
+import io
+import threading
+import webbrowser
+from pathlib import Path
+
+import joblib
+import numpy as np
+import torch
+import torchvision.transforms.functional as TF
+from flask import Flask, jsonify, render_template, request
+from PIL import Image
+from safetensors.torch import load_file
+from torchvision import transforms
+from werkzeug.utils import secure_filename
+
+from model import DigitCNN
+
+CLASSES   = ['51', '52', '53', '54', '55']
+NORM_MEAN = 0.1307
+NORM_STD  = 0.3081
+DEVICE    = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+BASE_DIR        = Path(__file__).parent
+MODELS_DIR      = BASE_DIR / 'models'
+MODELS_DIR.mkdir(exist_ok=True)
+ACTIVE_FILE     = MODELS_DIR / 'active.txt'
+SUPPORTED_EXTS  = ('.safetensors', '.joblib')
+
+DATA_DIR = BASE_DIR.parent / 'data' / 'dataset'
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+for _cls in CLASSES:
+    (DATA_DIR / _cls).mkdir(exist_ok=True)
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB
+
+eval_tfm = transforms.Compose([
+    transforms.Grayscale(num_output_channels=1),
+    transforms.Resize((28, 28)),
+    transforms.ToTensor(),
+    transforms.Normalize((NORM_MEAN,), (NORM_STD,)),
+])
+
+TTA_VARIANTS = [
+    dict(angle=0,  translate=(0, 0),  scale=1.00),
+    dict(angle=-4, translate=(0, 0),  scale=1.00),
+    dict(angle=4,  translate=(0, 0),  scale=1.00),
+    dict(angle=0,  translate=(0, 0),  scale=0.92),
+    dict(angle=0,  translate=(0, 0),  scale=1.08),
+    dict(angle=0,  translate=(-4, 0), scale=1.00),
+    dict(angle=0,  translate=(4, 0),  scale=1.00),
+    dict(angle=-3, translate=(0, 4),  scale=0.95),
+    dict(angle=3,  translate=(0, -4), scale=1.05),
+]
+
+try:
+    from scipy.ndimage import gaussian_filter as _gaussian_filter
+    from skimage.feature import hog as _skimage_hog
+    from skimage.filters import threshold_otsu as _threshold_otsu
+    SKIMAGE_OK = True
+except ImportError:
+    SKIMAGE_OK = False
+
+_lock  = threading.Lock()
+_state = {
+    'model':      None,
+    'kind':       None,
+    'classes':    CLASSES,
+    'filename':   None,
+    'input_type': 'raw',   # 'raw' or 'hog'
+}
+
+
+# ---------------- model helpers ----------------
+
+def load_cnn(path: Path):
+    model = DigitCNN(num_classes=len(CLASSES)).to(DEVICE)
+    state = load_file(str(path), device=str(DEVICE))
+    model.load_state_dict(state)
+    model.eval()
+    return model, CLASSES
+
+
+def load_rf(path: Path):
+    bundle = joblib.load(str(path))
+    if isinstance(bundle, dict) and 'model' in bundle:
+        model      = bundle['model']
+        classes    = list(bundle.get('classes', CLASSES))
+        input_type = bundle.get('input_type', 'raw')
+    else:
+        model      = bundle
+        classes    = list(CLASSES)
+        input_type = 'raw'
+    if not hasattr(model, 'predict_proba'):
+        raise ValueError('Loaded object has no predict_proba method.')
+    n_model_classes = len(getattr(model, 'classes_', []))
+    if n_model_classes and n_model_classes != len(classes):
+        raise ValueError(
+            f'Model has {n_model_classes} classes but bundle declares {len(classes)}.'
+        )
+    return model, classes, input_type
+
+
+def load_any(path: Path):
+    ext = path.suffix.lower()
+    if ext == '.safetensors':
+        model, classes = load_cnn(path)
+        return model, 'cnn', classes, 'raw'
+    if ext == '.joblib':
+        model, classes, input_type = load_rf(path)
+        return model, 'rf', classes, input_type
+    raise ValueError(f'Unsupported model extension: {ext}')
+
+
+def preprocess_hog(pil_img):
+    if not SKIMAGE_OK:
+        raise RuntimeError('scikit-image not installed. Run: .venv/Scripts/pip install scikit-image')
+    arr = np.array(pil_img.convert('L'), dtype=np.float32)
+    arr = _gaussian_filter(arr, sigma=0.8)
+    try:
+        thresh     = _threshold_otsu(arr)
+        digit_mask = arr < thresh
+        rows = np.any(digit_mask, axis=1)
+        cols = np.any(digit_mask, axis=0)
+        if rows.any() and cols.any():
+            r0, r1 = np.where(rows)[0][[0, -1]]
+            c0, c1 = np.where(cols)[0][[0, -1]]
+            side   = max(r1 - r0 + 1, c1 - c0 + 1)
+            pad    = max(int(side * 0.20), 3)
+            r0 = max(0, r0 - pad);   r1 = min(arr.shape[0]-1, r1 + pad)
+            c0 = max(0, c0 - pad);   c1 = min(arr.shape[1]-1, c1 + pad)
+            arr = arr[r0:r1+1, c0:c1+1]
+    except Exception:
+        pass
+    img_out = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+    img_out = img_out.resize((28, 28), Image.BILINEAR)
+    arr     = np.array(img_out, dtype=np.float32) / 255.0
+    return _skimage_hog(arr, orientations=9, pixels_per_cell=(4, 4),
+                        cells_per_block=(2, 2), block_norm='L2-Hys',
+                        visualize=False).astype(np.float32)
+
+
+def set_active(model, kind, classes, filename, input_type='raw'):
+    with _lock:
+        _state['model']      = model
+        _state['kind']       = kind
+        _state['classes']    = classes
+        _state['filename']   = filename
+        _state['input_type'] = input_type
+
+
+def list_model_files():
+    files = []
+    for p in sorted(MODELS_DIR.iterdir()):
+        if p.suffix.lower() in SUPPORTED_EXTS and not p.name.startswith('.'):
+            files.append(p.name)
+    return files
+
+
+def get_saved_active():
+    if ACTIVE_FILE.exists():
+        name = ACTIVE_FILE.read_text().strip()
+        p = MODELS_DIR / name
+        if p.exists():
+            return p
+    # Legacy fallback: look for current.* files from old scheme
+    for ext in SUPPORTED_EXTS:
+        p = MODELS_DIR / f'current{ext}'
+        if p.exists():
+            return p
+    return None
+
+
+def save_active_name(filename):
+    ACTIVE_FILE.write_text(filename)
+
+
+# Try to restore the last active model on startup.
+_active = get_saved_active()
+if _active is not None:
+    try:
+        _m, _k, _c, _it = load_any(_active)
+        set_active(_m, _k, _c, _active.name, _it)
+        print(f'[startup] loaded {_k.upper()} ({_it}) model from {_active.name}')
+    except Exception as e:
+        print(f'[startup] failed to load existing model: {e}')
+
+
+# ---------------- pages ----------------
+
+@app.route('/')
+def user_page():
+    return render_template('user.html')
+
+
+@app.route('/admin')
+def admin_page():
+    return render_template('admin.html')
+
+
+@app.route('/collect')
+def collect_page():
+    return render_template('collect.html')
+
+
+@app.route('/analysis')
+def analysis_page():
+    return render_template('analysis.html')
+
+
+# ---------------- API ----------------
+
+@app.route('/api/status')
+def api_status():
+    with _lock:
+        return jsonify({
+            'loaded':     _state['model'] is not None,
+            'kind':       _state['kind'],
+            'filename':   _state['filename'],
+            'classes':    _state['classes'],
+            'device':     str(DEVICE),
+            'input_type': _state['input_type'],
+        })
+
+
+@app.route('/api/models')
+def api_models():
+    with _lock:
+        active = _state['filename']
+    return jsonify({'models': list_model_files(), 'active': active})
+
+
+@app.route('/api/set-active', methods=['POST'])
+def api_set_active():
+    payload  = request.get_json(silent=True) or {}
+    filename = payload.get('filename')
+    if not filename:
+        return jsonify({'error': 'Missing "filename".'}), 400
+    path = MODELS_DIR / secure_filename(filename)
+    if not path.exists():
+        return jsonify({'error': f'Model not found: {filename}'}), 404
+    try:
+        model, kind, classes, input_type = load_any(path)
+    except Exception as e:
+        return jsonify({'error': f'Could not load model: {e}'}), 400
+    set_active(model, kind, classes, path.name, input_type)
+    save_active_name(path.name)
+    return jsonify({'success': True, 'filename': path.name, 'kind': kind, 'input_type': input_type})
+
+
+@app.route('/api/predict', methods=['POST'])
+def api_predict():
+    with _lock:
+        model      = _state['model']
+        kind       = _state['kind']
+        classes    = list(_state['classes'])
+        input_type = _state['input_type']
+    if model is None:
+        return jsonify({'error': 'No model loaded. Upload one at /admin first.'}), 400
+
+    payload   = request.get_json(silent=True) or {}
+    image_b64 = payload.get('image')
+    use_tta   = bool(payload.get('tta', True))
+    if not image_b64:
+        return jsonify({'error': 'Missing "image" (data URL or base64 PNG).'}), 400
+
+    if image_b64.startswith('data:'):
+        image_b64 = image_b64.split(',', 1)[1]
+    try:
+        img_bytes = base64.b64decode(image_b64)
+        pil = Image.open(io.BytesIO(img_bytes)).convert('L')
+    except Exception as e:
+        return jsonify({'error': f'Could not decode image: {e}'}), 400
+
+    variants = TTA_VARIANTS if use_tta else TTA_VARIANTS[:1]
+    warped = [
+        TF.affine(
+            pil,
+            angle=v['angle'],
+            translate=list(v['translate']),
+            scale=v['scale'],
+            shear=[0.0, 0.0],
+            fill=255,
+        )
+        for v in variants
+    ]
+
+    if kind == 'cnn':
+        batch = torch.cat([eval_tfm(p).unsqueeze(0) for p in warped], dim=0).to(DEVICE)
+        with torch.no_grad():
+            logits    = model(batch)
+            avg_probs = torch.softmax(logits, dim=1).mean(dim=0).cpu().numpy()
+
+    elif kind == 'rf':
+        if input_type == 'hog':
+            X = np.stack([preprocess_hog(p) for p in warped])
+        else:
+            X = np.stack([
+                np.asarray(p.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1)
+                for p in warped
+            ])
+        proba     = model.predict_proba(X)
+        avg_probs = proba.mean(axis=0)
+
+    else:
+        return jsonify({'error': f'Unknown model kind: {kind}'}), 500
+
+    probs_list = [float(x) for x in avg_probs.tolist()]
+    top = int(np.argmax(avg_probs))
+    return jsonify({
+        'prediction': classes[top],
+        'confidence': probs_list[top],
+        'probs':      dict(zip(classes, probs_list)),
+        'tta_count':  len(variants),
+        'kind':       kind,
+    })
+
+
+@app.route('/api/upload-model', methods=['POST'])
+def api_upload_model():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded (field name must be "file").'}), 400
+
+    f = request.files['file']
+    if not f.filename:
+        return jsonify({'error': 'Empty filename.'}), 400
+
+    safe_name = secure_filename(f.filename)
+    ext = Path(safe_name).suffix.lower()
+    if ext not in SUPPORTED_EXTS:
+        return jsonify({
+            'error': f'Only these file types are accepted: {", ".join(SUPPORTED_EXTS)}.'
+        }), 400
+
+    # Stage → validate → save. If validation fails the active model stays active.
+    staging = MODELS_DIR / ('.staging_' + safe_name)
+    f.save(str(staging))
+    try:
+        new_model, new_kind, new_classes, new_input_type = load_any(staging)
+    except Exception as e:
+        try:
+            staging.unlink()
+        except Exception:
+            pass
+        return jsonify({'error': f'Could not load uploaded model: {e}'}), 400
+
+    target = MODELS_DIR / safe_name
+    staging.replace(target)
+    set_active(new_model, new_kind, new_classes, safe_name, new_input_type)
+    save_active_name(safe_name)
+
+    return jsonify({
+        'success':    True,
+        'filename':   safe_name,
+        'kind':       new_kind,
+        'message':    f'{new_kind.upper()} model uploaded and activated.',
+        'size_bytes': target.stat().st_size,
+    })
+
+
+def load_dataset_images():
+    pil_images, true_labels = [], []
+    for cls in CLASSES:
+        for p in sorted((DATA_DIR / cls).glob('*.png')):
+            try:
+                pil_images.append(Image.open(str(p)).convert('L'))
+                true_labels.append(cls)
+            except Exception:
+                pass
+    return pil_images, true_labels
+
+
+def predict_batch(model, kind, classes, pil_images, input_type='raw'):
+    if kind == 'cnn':
+        batch = torch.stack([eval_tfm(img) for img in pil_images]).to(DEVICE)
+        with torch.no_grad():
+            preds = model(batch).argmax(1).cpu().numpy()
+        return [classes[int(p)] for p in preds]
+    else:
+        if input_type == 'hog':
+            X = np.stack([preprocess_hog(img) for img in pil_images])
+        else:
+            X = np.stack([
+                np.asarray(img.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1)
+                for img in pil_images
+            ])
+        raw = model.predict(X)
+        model_cls = list(getattr(model, 'classes_', range(len(classes))))
+        return [classes[model_cls.index(p) if p in model_cls else int(p)] for p in raw]
+
+
+@app.route('/api/dataset-stats')
+def api_dataset_stats():
+    stats = {}
+    for cls in CLASSES:
+        stats[cls] = len(list((DATA_DIR / cls).glob('*.png')))
+    return jsonify({'stats': stats, 'total': sum(stats.values())})
+
+
+@app.route('/api/save-sample', methods=['POST'])
+def api_save_sample():
+    payload = request.get_json(silent=True) or {}
+    image_b64 = payload.get('image')
+    label = payload.get('label')
+
+    if not image_b64:
+        return jsonify({'error': 'Missing "image".'}), 400
+    if label not in CLASSES:
+        return jsonify({'error': f'Invalid label "{label}". Must be one of {CLASSES}.'}), 400
+
+    if image_b64.startswith('data:'):
+        image_b64 = image_b64.split(',', 1)[1]
+    try:
+        img_bytes = base64.b64decode(image_b64)
+        pil = Image.open(io.BytesIO(img_bytes)).convert('L').resize((28, 28))
+    except Exception as e:
+        return jsonify({'error': f'Could not decode image: {e}'}), 400
+
+    cls_dir = DATA_DIR / label
+    existing = sorted(cls_dir.glob('*.png'))
+    next_idx = len(existing) + 1
+    filename = f'{next_idx:03d}.png'
+    pil.save(str(cls_dir / filename))
+
+    count = len(list(cls_dir.glob('*.png')))
+    return jsonify({'success': True, 'filename': filename, 'label': label, 'count': count})
+
+
+@app.route('/api/run-analysis')
+def api_run_analysis():
+    with _lock:
+        model      = _state['model']
+        kind       = _state['kind']
+        classes    = list(_state['classes'])
+        input_type = _state['input_type']
+    if model is None:
+        return jsonify({'error': 'No model loaded.'}), 400
+
+    pil_images, true_labels = load_dataset_images()
+    if not pil_images:
+        return jsonify({'error': 'No dataset images found in data/dataset/.'}), 400
+
+    pred_labels = predict_batch(model, kind, classes, pil_images, input_type)
+
+    cm = [[0] * len(classes) for _ in classes]
+    for t, p in zip(true_labels, pred_labels):
+        cm[classes.index(t)][classes.index(p)] += 1
+
+    per_class = {}
+    for cls in classes:
+        tp = sum(1 for t, p in zip(true_labels, pred_labels) if t == cls and p == cls)
+        fp = sum(1 for t, p in zip(true_labels, pred_labels) if t != cls and p == cls)
+        fn = sum(1 for t, p in zip(true_labels, pred_labels) if t == cls and p != cls)
+        support = tp + fn
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec  = tp / (tp + fn) if (tp + fn) else 0.0
+        f1   = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        per_class[cls] = {'precision': round(prec, 4), 'recall': round(rec, 4),
+                          'f1': round(f1, 4), 'support': support, 'correct': tp}
+
+    misclassified = []
+    for img, t, p in zip(pil_images, true_labels, pred_labels):
+        if t == p:
+            continue
+        buf = io.BytesIO()
+        img.resize((56, 56), Image.NEAREST).save(buf, format='PNG')
+        misclassified.append({
+            'true': t, 'pred': p,
+            'img': base64.b64encode(buf.getvalue()).decode(),
+        })
+        if len(misclassified) >= 20:
+            break
+
+    n_correct = sum(1 for t, p in zip(true_labels, pred_labels) if t == p)
+    return jsonify({
+        'accuracy': round(n_correct / len(true_labels), 4),
+        'n_total': len(true_labels),
+        'n_errors': len(true_labels) - n_correct,
+        'cm': cm,
+        'classes': classes,
+        'per_class': per_class,
+        'misclassified': misclassified,
+        'kind': kind,
+    })
+
+
+@app.route('/api/run-cv')
+def api_run_cv():
+    with _lock:
+        model_obj  = _state['model']
+        kind       = _state['kind']
+        classes    = list(_state['classes'])
+        input_type = _state['input_type']
+    if model_obj is None:
+        return jsonify({'error': 'No model loaded.'}), 400
+
+    pil_images, true_labels = load_dataset_images()
+    if len(pil_images) < 10:
+        return jsonify({'error': 'Not enough images (need at least 10).'}), 400
+
+    from sklearn.model_selection import StratifiedKFold
+
+    y = np.array([classes.index(lbl) for lbl in true_labels])
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    folds = []
+
+    if kind == 'rf':
+        from sklearn.ensemble import RandomForestClassifier
+        X = np.stack([
+            np.asarray(img.resize((28, 28), Image.BILINEAR), dtype=np.uint8).reshape(-1)
+            for img in pil_images
+        ])
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X, y)):
+            clf = RandomForestClassifier(
+                n_estimators=200, max_features='sqrt',
+                class_weight='balanced', random_state=42, n_jobs=-1,
+            )
+            clf.fit(X[train_idx], y[train_idx])
+            preds = clf.predict(X[val_idx])
+            acc = float((preds == y[val_idx]).mean())
+            folds.append({'fold': fold_idx + 1, 'accuracy': round(acc, 4),
+                          'n_val': int(len(val_idx))})
+
+    elif kind == 'cnn':
+        all_imgs = pil_images
+        for fold_idx, (_, val_idx) in enumerate(skf.split(np.zeros(len(y)), y)):
+            val_imgs  = [all_imgs[i] for i in val_idx]
+            val_true  = [true_labels[i] for i in val_idx]
+            val_preds = predict_batch(model_obj, kind, classes, val_imgs)
+            acc = sum(1 for t, p in zip(val_true, val_preds) if t == p) / len(val_true)
+            folds.append({'fold': fold_idx + 1, 'accuracy': round(acc, 4),
+                          'n_val': len(val_idx)})
+
+    accs = [f['accuracy'] for f in folds]
+    return jsonify({
+        'folds': folds,
+        'mean_accuracy': round(float(np.mean(accs)), 4),
+        'std_accuracy':  round(float(np.std(accs)),  4),
+        'n_total': len(y),
+        'kind': kind,
+        'note': ('5-fold CV with retraining each fold' if kind == 'rf'
+                 else 'Evaluation-only CV — current model tested on each fold without retraining'),
+    })
+
+
+@app.route('/api/compare-models')
+def api_compare_models():
+    pil_images, true_labels = load_dataset_images()
+    if not pil_images:
+        return jsonify({'error': 'No dataset images found in data/dataset/.'}), 400
+
+    model_files = list_model_files()
+    if not model_files:
+        return jsonify({'error': 'No model files found in app/models/.'}), 400
+
+    from sklearn.metrics import (
+        accuracy_score, precision_score, recall_score, f1_score
+    )
+    results = []
+    for fname in model_files:
+        path = MODELS_DIR / fname
+        try:
+            m, kind, classes, input_type = load_any(path)
+            pred_labels = predict_batch(m, kind, classes, pil_images, input_type)
+            true_idx = [classes.index(t) if t in classes else -1 for t in true_labels]
+            pred_idx = [classes.index(p) if p in classes else -1 for p in pred_labels]
+            results.append({
+                'name':       fname,
+                'kind':       kind,
+                'input_type': input_type,
+                'accuracy':   round(accuracy_score(true_idx, pred_idx), 4),
+                'precision':  round(precision_score(true_idx, pred_idx, average='macro', zero_division=0), 4),
+                'recall':     round(recall_score(true_idx, pred_idx,    average='macro', zero_division=0), 4),
+                'f1':         round(f1_score(true_idx, pred_idx,        average='macro', zero_division=0), 4),
+            })
+        except Exception as e:
+            results.append({'name': fname, 'error': str(e)})
+
+    results.sort(key=lambda r: r.get('f1', -1), reverse=True)
+    return jsonify({'results': results, 'n_samples': len(pil_images)})
+
+
+if __name__ == '__main__':
+    PORT = 5000
+    URL  = f'http://localhost:{PORT}/'
+    print(f'\n  Server starting at {URL}\n  Press Ctrl+C to stop.\n')
+    threading.Timer(1.5, lambda: webbrowser.open(URL)).start()
+    app.run(host='127.0.0.1', port=PORT, debug=True, use_reloader=False)

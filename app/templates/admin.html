@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Admin — Model Upload</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+
+<nav>
+  <a href="/">Predict</a>
+  <a href="/admin" class="active">Admin</a>
+  <a href="/collect">Collect</a>
+  <a href="/analysis">Analysis</a>
+  <span class="spacer"></span>
+  <span class="status" id="modelStatus">checking…</span>
+</nav>
+
+<h1>Model Management</h1>
+<p class="muted">Upload a <code>.safetensors</code> (CNN) or <code>.joblib</code> (Random Forest) file to swap the
+active model. The server validates by loading the file before activating it — if the file is incompatible
+the previously active model stays active.</p>
+
+<div class="card">
+  <h2>Current model</h2>
+  <div class="kv"><span class="k">Filename</span><span class="v" id="curName">—</span></div>
+  <div class="kv"><span class="k">Kind</span>    <span class="v" id="curKind">—</span></div>
+  <div class="kv"><span class="k">Status</span>  <span class="v" id="curStatus">—</span></div>
+  <div class="kv"><span class="k">Device</span>  <span class="v" id="curDevice">—</span></div>
+  <div class="kv"><span class="k">Classes</span> <span class="v" id="curClasses">—</span></div>
+</div>
+
+<div class="card">
+  <h2>Upload new model</h2>
+  <div class="row">
+    <button id="pickBtn" class="">Choose .safetensors or .joblib</button>
+    <input type="file" id="modelFile" accept=".safetensors,.joblib" />
+    <span id="fileName" class="muted">no file selected</span>
+  </div>
+  <div class="row">
+    <button id="uploadBtn" class="primary" disabled>Upload &amp; activate</button>
+  </div>
+  <div id="banner" class="banner"></div>
+</div>
+
+<script>
+const statusEl   = document.getElementById('modelStatus');
+const curName    = document.getElementById('curName');
+const curKind    = document.getElementById('curKind');
+const curStatus  = document.getElementById('curStatus');
+const curDevice  = document.getElementById('curDevice');
+const curClasses = document.getElementById('curClasses');
+const modelFile  = document.getElementById('modelFile');
+const pickBtn    = document.getElementById('pickBtn');
+const fileName   = document.getElementById('fileName');
+const uploadBtn  = document.getElementById('uploadBtn');
+const banner     = document.getElementById('banner');
+
+const VALID_EXTS = ['.safetensors', '.joblib'];
+
+let pickedFile = null;   // File from either the FS-Access picker or the <input>
+
+// --- tiny IndexedDB key/value, used to remember the last picked file's handle
+//     so future pickers can start in the same folder.
+const IDB_NAME = 'digitPredictorAdmin';
+function _idb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open(IDB_NAME, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => res(r.result);
+    r.onerror   = () => rej(r.error);
+  });
+}
+async function idbGet(k) {
+  const db = await _idb();
+  return new Promise((res, rej) => {
+    const t = db.transaction('kv', 'readonly');
+    const r = t.objectStore('kv').get(k);
+    r.onsuccess = () => res(r.result);
+    r.onerror   = () => rej(r.error);
+  });
+}
+async function idbSet(k, v) {
+  const db = await _idb();
+  return new Promise((res, rej) => {
+    const t = db.transaction('kv', 'readwrite');
+    t.objectStore('kv').put(v, k);
+    t.oncomplete = () => res();
+    t.onerror    = () => rej(t.error);
+  });
+}
+
+async function pickWithFsAccess() {
+  // Default to the OS Downloads folder (where Colab usually drops the model file).
+  // If we previously remembered a handle, use that instead so the picker opens
+  // in whichever folder the user last picked from.
+  let startIn = 'downloads';
+  try {
+    const last = await idbGet('lastFileHandle');
+    if (last) {
+      const perm = await last.queryPermission({ mode: 'read' });
+      if (perm === 'granted') startIn = last;
+    }
+  } catch { /* ignore — fall back to 'downloads' */ }
+
+  try {
+    const [handle] = await window.showOpenFilePicker({
+      types: [{
+        description: 'Model files',
+        accept: { 'application/octet-stream': ['.safetensors', '.joblib'] },
+      }],
+      multiple: false,
+      excludeAcceptAllOption: false,
+      startIn,
+    });
+    const file = await handle.getFile();
+    onFilePicked(file);
+    // Save the handle so next time the picker opens in this same folder.
+    try { await idbSet('lastFileHandle', handle); } catch { /* non-fatal */ }
+  } catch (err) {
+    if (err && err.name !== 'AbortError') {
+      showBanner('err', 'File picker error: ' + err.message);
+    }
+  }
+}
+
+pickBtn.addEventListener('click', () => {
+  if (window.showOpenFilePicker) {
+    pickWithFsAccess();
+  } else {
+    // Firefox / Safari path: regular hidden <input>.
+    modelFile.click();
+  }
+});
+
+modelFile.addEventListener('change', () => {
+  const f = modelFile.files[0];
+  if (f) onFilePicked(f);
+});
+
+function onFilePicked(f) {
+  pickedFile = f;
+  fileName.textContent = `${f.name}  (${(f.size / 1024).toFixed(1)} KB)`;
+  const lower = f.name.toLowerCase();
+  uploadBtn.disabled = !VALID_EXTS.some(ext => lower.endsWith(ext));
+  hideBanner();
+}
+
+function showBanner(kind, msg) {
+  banner.className = 'banner ' + kind;
+  banner.textContent = msg;
+}
+function hideBanner() {
+  banner.className = 'banner';
+  banner.textContent = '';
+}
+
+function kindBadge(kind) {
+  if (!kind) return '—';
+  const k = kind.toLowerCase();
+  return `<span class="kind-badge ${k}">${k.toUpperCase()}</span>`;
+}
+
+async function refreshStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    curName.textContent    = s.filename || '—';
+    curKind.innerHTML      = s.kind ? kindBadge(s.kind) : '—';
+    curStatus.textContent  = s.loaded ? 'loaded' : 'not loaded';
+    curDevice.textContent  = s.device;
+    curClasses.textContent = (s.classes || []).join(', ');
+    if (s.loaded) {
+      statusEl.className   = 'status loaded';
+      statusEl.innerHTML   = `model: ${s.filename} ${kindBadge(s.kind)} • ${s.device}`;
+    } else {
+      statusEl.className   = 'status unloaded';
+      statusEl.textContent = 'no model loaded';
+    }
+  } catch (err) {
+    statusEl.className   = 'status unloaded';
+    statusEl.textContent = 'backend unreachable';
+    curName.textContent = curStatus.textContent = curDevice.textContent = curClasses.textContent = '—';
+    curKind.textContent = '—';
+  }
+}
+refreshStatus();
+
+uploadBtn.addEventListener('click', async () => {
+  if (!pickedFile) return;
+  uploadBtn.disabled = true;
+  showBanner('info', 'Uploading & validating…');
+  try {
+    const fd = new FormData();
+    fd.append('file', pickedFile);
+    const res = await fetch('/api/upload-model', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+      showBanner('err', 'Failed: ' + (data.error || 'unknown error'));
+    } else {
+      showBanner('ok', `Activated ${data.filename} as ${data.kind.toUpperCase()} (${(data.size_bytes / 1024).toFixed(1)} KB)`);
+      pickedFile = null;
+      modelFile.value = '';
+      fileName.textContent = 'no file selected';
+      await refreshStatus();
+    }
+  } catch (err) {
+    showBanner('err', 'Network error: ' + (err.message || err));
+  } finally {
+    uploadBtn.disabled = !pickedFile;
+  }
+});
+</script>
+</body>
+</html>

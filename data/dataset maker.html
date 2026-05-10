@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Thai Number Dataset Creator</title>
+    <style>
+        body { font-family: Arial, sans-serif; display: flex; flex-direction: column; align-items: center; background-color: #4e4e4e; margin-top: 30px; }
+        h1 { color: #333; margin-bottom: 10px; }
+        .setup-section { background-color: #fff3cd; border: 2px solid #ffeeba; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: center; }
+        .setup-btn { padding: 10px 20px; font-size: 16px; font-weight: bold; cursor: pointer; background-color: #ffc107; color: #333; border: none; border-radius: 5px; }
+        .setup-btn:hover { background-color: #e0a800; }
+        .controls { margin-bottom: 10px; }
+        .settings { margin-bottom: 20px; font-size: 16px; font-weight: bold; color: #333; }
+        select { padding: 5px 10px; font-size: 16px; border-radius: 5px; }
+        button.class-btn { padding: 10px 15px; font-size: 16px; margin: 0 5px; cursor: pointer; border: 2px solid #007bff; background-color: white; color: #007bff; border-radius: 5px; transition: 0.2s; }
+        button.class-btn:hover, button.class-btn.active { background-color: #007bff; color: white; }
+        .status { font-size: 18px; margin-bottom: 10px; }
+        canvas { border: 2px solid #333; background-color: white; border-radius: 8px; cursor: crosshair; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+        .instructions { margin-top: 15px; color: #555; text-align: center; line-height: 1.6; }
+        .counter-display { display: flex; gap: 15px; margin-top: 15px; font-size: 14px; font-weight: bold; color: #444; }
+        .reset-btn { margin-top: 10px; padding: 5px 10px; font-size: 12px; cursor: pointer; background-color: #dc3545; color: white; border: none; border-radius: 4px; }
+        .reset-btn:hover { background-color: #c82333; }
+    </style>
+</head>
+<body>
+
+    <h1>Thai Number Dataset Creator</h1>
+
+    <div class="setup-section" id="setup-box">
+        <p><strong>Step 1:</strong> Select a folder to save your dataset.</p>
+        <button class="setup-btn" onclick="selectBaseFolder()">Select Dataset Folder</button>
+        <p id="folder-status" style="margin-top: 10px; color: #856404; font-weight: bold;"></p>
+    </div>
+
+    <div class="settings">
+        <label for="exportSize">Export Resolution: </label>
+        <select id="exportSize">
+            <option value="28">28 x 28 px (MNIST Standard)</option>
+            <option value="64">64 x 64 px</option>
+            <option value="224">224 x 224 px (ResNet Standard)</option>
+            <option value="400">400 x 400 px (Original)</option>
+        </select>
+    </div>
+
+    <div class="controls">
+        <button id="btn-51" class="class-btn active" onclick="selectNumber('51', '๕๑')">๕๑ (51)</button>
+        <button id="btn-52" class="class-btn" onclick="selectNumber('52', '๕๒')">๕๒ (52)</button>
+        <button id="btn-53" class="class-btn" onclick="selectNumber('53', '๕๓')">๕๓ (53)</button>
+        <button id="btn-54" class="class-btn" onclick="selectNumber('54', '๕๔')">๕๔ (54)</button>
+        <button id="btn-55" class="class-btn" onclick="selectNumber('55', '๕๕')">๕๕ (55)</button>
+    </div>
+
+    <div class="status">
+        <strong>Current Class:</strong> <span id="currentTarget">๕๑ (51)</span> | 
+        <strong>Next File:</strong> <span id="currentFilename">51/001.png</span>
+    </div>
+
+    <canvas id="drawingCanvas" width="400" height="400"></canvas>
+
+    <div class="counter-display">
+        <span>51: <span id="count-51">0</span></span>
+        <span>52: <span id="count-52">0</span></span>
+        <span>53: <span id="count-53">0</span></span>
+        <span>54: <span id="count-54">0</span></span>
+        <span>55: <span id="count-55">0</span></span>
+    </div>
+    
+    <button class="reset-btn" onclick="resetCounters()">Reset All Counters</button>
+
+    <p class="instructions">
+        <em>Draw inside the box. <br>
+        Press <strong>Enter</strong> to automatically resize and save.<br>
+        Press <strong>Backspace</strong> to clear without saving.</em>
+    </p>
+
+    <script>
+        const canvas = document.getElementById('drawingCanvas');
+        const ctx = canvas.getContext('2d');
+        
+        let isDrawing = false;
+        let currentNum = '51';
+        let baseDirectoryHandle = null;
+        
+        let counts = { '51': 1, '52': 1, '53': 1, '54': 1, '55': 1 };
+        const savedCounts = localStorage.getItem('thaiNumberDatasetCounts');
+        if (savedCounts) { counts = JSON.parse(savedCounts); }
+
+        function updateAllCounterDisplays() {
+            for (let key in counts) {
+                document.getElementById(`count-${key}`).innerText = counts[key] - 1;
+            }
+            updateFilenameDisplay();
+        }
+
+        function resetCanvas() {
+            ctx.fillStyle = "white";
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.strokeStyle = "black";
+            ctx.lineWidth = 10; // Slightly thicker brush looks better when downscaled
+            ctx.lineCap = "round";
+            ctx.lineJoin = "round";
+        }
+        
+        resetCanvas();
+        updateAllCounterDisplays();
+
+        // ---------------- Dropdown Focus Fix ----------------
+        document.getElementById('exportSize').addEventListener('change', function() {
+            document.activeElement.blur(); 
+        });
+
+        // ---------------- File System Setup ----------------
+        async function selectBaseFolder() {
+            try {
+                baseDirectoryHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+                document.getElementById('folder-status').innerText = `✅ Connected! Saving directly to: ${baseDirectoryHandle.name}`;
+                document.getElementById('setup-box').style.backgroundColor = "#d4edda";
+                document.getElementById('setup-box').style.borderColor = "#c3e6cb";
+                document.activeElement.blur(); 
+            } catch (err) {
+                document.getElementById('folder-status').innerText = "❌ Folder selection failed or cancelled.";
+            }
+        }
+
+        // ---------------- Drawing Logic ----------------
+        canvas.addEventListener('mousedown', startPosition);
+        canvas.addEventListener('mouseup', endPosition);
+        canvas.addEventListener('mousemove', draw);
+        canvas.addEventListener('mouseout', endPosition);
+
+        function startPosition(e) { isDrawing = true; draw(e); }
+        function endPosition() { isDrawing = false; ctx.beginPath(); }
+
+        function draw(e) {
+            if (!isDrawing) return;
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            ctx.lineTo(x, y);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+        }
+
+        function selectNumber(num, thaiStr) {
+            currentNum = num;
+            document.getElementById('currentTarget').innerText = `${thaiStr} (${num})`;
+            updateFilenameDisplay();
+            document.querySelectorAll('.controls .class-btn').forEach(btn => btn.classList.remove('active'));
+            document.getElementById(`btn-${num}`).classList.add('active');
+            document.activeElement.blur(); 
+        }
+
+        function updateFilenameDisplay() {
+            const countStr = counts[currentNum].toString().padStart(3, '0');
+            document.getElementById('currentFilename').innerText = `${currentNum}/${countStr}.png`;
+        }
+
+        document.addEventListener('keydown', async function(e) {
+            if (e.key === 'Enter') {
+                if (!baseDirectoryHandle) {
+                    alert("⚠️ You must click 'Select Dataset Folder' first!");
+                    return;
+                }
+                await saveImageDirectly();
+            } else if (e.key === 'Backspace') {
+                e.preventDefault();
+                resetCanvas();
+            }
+        });
+
+        // ---------------- Auto-Resize & File Saving ----------------
+        async function saveImageDirectly() {
+            try {
+                const classFolderHandle = await baseDirectoryHandle.getDirectoryHandle(currentNum, { create: true });
+                const countStr = counts[currentNum].toString().padStart(3, '0');
+                const filename = `${countStr}.png`;
+                const fileHandle = await classFolderHandle.getFileHandle(filename, { create: true });
+                const writable = await fileHandle.createWritable();
+                
+                // Get the chosen output size
+                const outputSize = parseInt(document.getElementById('exportSize').value);
+                
+                // Create a temporary hidden canvas to downscale the image
+                const tempCanvas = document.createElement('canvas');
+                tempCanvas.width = outputSize;
+                tempCanvas.height = outputSize;
+                const tempCtx = tempCanvas.getContext('2d');
+                
+                // Draw the big canvas onto the small canvas
+                tempCtx.drawImage(canvas, 0, 0, outputSize, outputSize);
+                
+                // Save the SMALL canvas
+                tempCanvas.toBlob(async (blob) => {
+                    await writable.write(blob);
+                    await writable.close();
+                    
+                    document.getElementById(`count-${currentNum}`).innerText = counts[currentNum];
+                    counts[currentNum]++;
+                    localStorage.setItem('thaiNumberDatasetCounts', JSON.stringify(counts));
+                    updateFilenameDisplay();
+                    
+                    ctx.fillStyle = "#e0ffe0";
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+                    setTimeout(resetCanvas, 100);
+                }, 'image/png');
+
+            } catch (err) {
+                console.error("Error writing file:", err);
+                alert("Failed to save file. Did you accidentally revoke permission?");
+            }
+        }
+
+        function resetCounters() {
+            if(confirm("Are you sure you want to reset all file counters back to 001?")) {
+                counts = { '51': 1, '52': 1, '53': 1, '54': 1, '55': 1 };
+                localStorage.setItem('thaiNumberDatasetCounts', JSON.stringify(counts));
+                updateAllCounterDisplays();
+                document.activeElement.blur(); 
+            }
+        }
+    </script>
+</body>
+</html>
