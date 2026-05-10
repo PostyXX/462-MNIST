@@ -582,8 +582,11 @@ def api_compare_models():
 
 
 if __name__ == '__main__':
-    PORT = 5000
-    URL  = f'http://localhost:{PORT}/'
-    print(f'\n  Server starting at {URL}\n  Press Ctrl+C to stop.\n')
-    threading.Timer(1.5, lambda: webbrowser.open(URL)).start()
-    app.run(host='127.0.0.1', port=PORT, debug=True, use_reloader=False)
+    import os
+    PORT = int(os.environ.get('PORT', 5000))
+    is_local = os.environ.get('RENDER') is None
+    if is_local:
+        URL = f'http://localhost:{PORT}/'
+        print(f'\n  Server starting at {URL}\n  Press Ctrl+C to stop.\n')
+        threading.Timer(1.5, lambda: webbrowser.open(URL)).start()
+    app.run(host='0.0.0.0', port=PORT, debug=is_local, use_reloader=False)
