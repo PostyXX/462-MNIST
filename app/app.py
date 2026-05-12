@@ -29,17 +29,6 @@ for _cls in CLASSES:
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 
-TTA_VARIANTS = [
-    dict(angle=0,  translate=(0, 0),  scale=1.00),
-    dict(angle=-4, translate=(0, 0),  scale=1.00),
-    dict(angle=4,  translate=(0, 0),  scale=1.00),
-    dict(angle=0,  translate=(0, 0),  scale=0.92),
-    dict(angle=0,  translate=(0, 0),  scale=1.08),
-    dict(angle=0,  translate=(-4, 0), scale=1.00),
-    dict(angle=0,  translate=(4, 0),  scale=1.00),
-    dict(angle=-3, translate=(0, 4),  scale=0.95),
-    dict(angle=3,  translate=(0, -4), scale=1.05),
-]
 
 
 _lock  = threading.Lock()
@@ -90,17 +79,6 @@ def _stratified_kfold(y, n_splits=5, random_state=42):
 
 
 # ---------------- preprocessing ----------------
-
-def pil_affine(img, angle=0, translate=(0, 0), scale=1.0, fill=255):
-    w, h = img.size
-    img = img.rotate(angle, fillcolor=fill, resample=Image.BILINEAR)
-    new_w, new_h = int(w * scale), int(h * scale)
-    img = img.resize((new_w, new_h), Image.BILINEAR)
-    result = Image.new('L', (w, h), fill)
-    ox = (w - new_w) // 2 + translate[0]
-    oy = (h - new_h) // 2 + translate[1]
-    result.paste(img, (ox, oy))
-    return result
 
 
 def preprocess_cnn(pil_img):
@@ -255,7 +233,6 @@ def api_predict():
 
     payload   = request.get_json(silent=True) or {}
     image_b64 = payload.get('image')
-    use_tta   = bool(payload.get('tta', True))
     if not image_b64:
         return jsonify({'error': 'Missing "image" (data URL or base64 PNG).'}), 400
 
@@ -267,33 +244,25 @@ def api_predict():
     except Exception as e:
         return jsonify({'error': f'Could not decode image: {e}'}), 400
 
-    variants = TTA_VARIANTS if use_tta else TTA_VARIANTS[:1]
-    warped = [pil_affine(pil, **v, fill=255) for v in variants]
-
     if kind == 'cnn':
-        batch = np.concatenate([preprocess_cnn(p) for p in warped], axis=0)
+        batch = preprocess_cnn(pil)
         logits = model.run(['output'], {'input': batch})[0]
-        avg_probs = softmax(logits).mean(axis=0)
+        probs = softmax(logits)[0]
 
     elif kind == 'rf':
-        X = np.stack([
-            np.asarray(p.resize((28, 28), Image.BILINEAR), dtype=np.float32).reshape(-1) / 255.0
-            for p in warped
-        ])
+        X = np.asarray(pil.resize((28, 28), Image.BILINEAR), dtype=np.float32).reshape(1, -1) / 255.0
         _, proba_dicts = model.run(None, {'float_input': X})
-        proba = np.array([[d[c] for c in classes] for d in proba_dicts])
-        avg_probs = proba.mean(axis=0)
+        probs = np.array([proba_dicts[0][c] for c in classes])
 
     else:
         return jsonify({'error': f'Unknown model kind: {kind}'}), 500
 
-    probs_list = [float(x) for x in avg_probs.tolist()]
-    top = int(np.argmax(avg_probs))
+    probs_list = [float(x) for x in probs.tolist()]
+    top = int(np.argmax(probs))
     return jsonify({
         'prediction': classes[top],
         'confidence': probs_list[top],
         'probs':      dict(zip(classes, probs_list)),
-        'tta_count':  len(variants),
         'kind':       kind,
     })
 

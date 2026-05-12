@@ -37,10 +37,6 @@
 <div class="row">
   <button id="predictBtn" class="primary" disabled>Predict</button>
   <button id="clearBtn">Clear</button>
-  <label class="toggle">
-    <input type="checkbox" id="ttaChk" checked />
-    Test-Time Augmentation
-  </label>
 </div>
 
 <div id="result">
@@ -111,7 +107,6 @@ const previewC  = document.getElementById('preview');
 const previewX  = previewC.getContext('2d');
 const predictBtn= document.getElementById('predictBtn');
 const clearBtn  = document.getElementById('clearBtn');
-const ttaChk    = document.getElementById('ttaChk');
 const statusEl  = document.getElementById('modelStatus');
 const predEl    = document.getElementById('pred');
 const thaiEl    = document.getElementById('thai');
@@ -196,7 +191,7 @@ predictBtn.addEventListener('click', async () => {
     const res = await fetch('/api/predict', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ image: dataUrl, tta: ttaChk.checked }),
+      body:    JSON.stringify({ image: dataUrl }),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -207,9 +202,8 @@ predictBtn.addEventListener('click', async () => {
 
     predEl.textContent = data.prediction;
     thaiEl.textContent = THAI[data.prediction] || '';
-    const ttaNote = ttaChk.checked ? `   (averaged over ${data.tta_count} TTA variants)` : '';
     const kindNote = data.kind ? `   [${data.kind.toUpperCase()}]` : '';
-    confEl.textContent = `confidence: ${(data.confidence * 100).toFixed(1)}%${ttaNote}${kindNote}`;
+    confEl.textContent = `confidence: ${(data.confidence * 100).toFixed(1)}%${kindNote}`;
 
     barsEl.innerHTML = Object.entries(data.probs).map(([cls, p]) => `
       <div class="bar-row">
